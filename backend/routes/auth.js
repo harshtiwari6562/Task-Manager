@@ -7,9 +7,10 @@ import requireAuth from '../middleware/auth.js';
 const router = Router();
 
 function signToken(user) {
-  return jwt.sign({ sub: user._id.toString() }, process.env.JWT_SECRET, { expiresIn: '30d' });
+  return jwt.sign({ sub: String(user.id) }, process.env.JWT_SECRET, { expiresIn: '30d' });
 }
 
+// POST /api/auth/register
 router.post('/register', async (req, res) => {
   try {
     const { name, email, password } = req.body || {};
@@ -20,23 +21,21 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
 
-    const existing = await User.findOne({ email: email.toLowerCase().trim() });
+    const existing = await User.findByEmail(email);
     if (existing) {
       return res.status(409).json({ error: 'An account with this email already exists' });
     }
 
-    const user = new User({ name: name.trim(), email: email.toLowerCase().trim() });
-    await user.setPassword(password);
-    await user.save();
-
+    const user = await User.create({ name, email, password });
     const token = signToken(user);
-    res.status(201).json({ token, user: user.toSafeJSON() });
+    res.status(201).json({ token, user: User.toSafeJSON(user) });
   } catch (err) {
     console.error('Register error:', err);
     res.status(500).json({ error: 'Something went wrong while creating your account' });
   }
 });
 
+// POST /api/auth/login
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -44,35 +43,37 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    const user = await User.findByEmail(email);
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const valid = await user.checkPassword(password);
+    const valid = await User.checkPassword(user, password);
     if (!valid) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
     const token = signToken(user);
-    res.json({ token, user: user.toSafeJSON() });
+    res.json({ token, user: User.toSafeJSON(user) });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'Something went wrong while logging in' });
   }
 });
 
+// GET /api/auth/me
 router.get('/me', requireAuth, async (req, res) => {
   try {
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ user: user.toSafeJSON() });
+    res.json({ user: User.toSafeJSON(user) });
   } catch (err) {
     console.error('Me error:', err);
     res.status(500).json({ error: 'Something went wrong' });
   }
 });
 
+// PUT /api/auth/password
 router.put('/password', requireAuth, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body || {};
@@ -84,18 +85,12 @@ router.put('/password', requireAuth, async (req, res) => {
     }
 
     const user = await User.findById(req.userId);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const valid = await user.checkPassword(currentPassword);
-    if (!valid) {
-      return res.status(401).json({ error: 'Incorrect current password' });
-    }
+    const valid = await User.checkPassword(user, currentPassword);
+    if (!valid) return res.status(401).json({ error: 'Incorrect current password' });
 
-    await user.setPassword(newPassword);
-    await user.save();
-
+    await User.setPassword(req.userId, newPassword);
     res.json({ message: 'Password updated successfully' });
   } catch (err) {
     console.error('Password update error:', err);
@@ -103,10 +98,11 @@ router.put('/password', requireAuth, async (req, res) => {
   }
 });
 
+// DELETE /api/auth/account
 router.delete('/account', requireAuth, async (req, res) => {
   try {
-    await UserData.deleteMany({ userId: req.userId });
-    await User.findByIdAndDelete(req.userId);
+    await UserData.deleteAllForUser(req.userId);
+    await User.deleteById(req.userId);
     res.json({ deleted: true });
   } catch (err) {
     console.error('Delete account error:', err);

@@ -1,9 +1,10 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import mongoose from 'mongoose';
+import { initDB } from './db.js';
 import authRoutes from './routes/auth.js';
 import dataRoutes from './routes/data.js';
+import aiRoutes from './routes/ai.js';
 import requireAuth from './middleware/auth.js';
 
 const app = express();
@@ -14,18 +15,19 @@ app.use(express.json());
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.use('/api/auth', authRoutes);
 app.use('/api/data', requireAuth, dataRoutes);
+app.use('/api/ai', requireAuth, aiRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
 const PORT = process.env.PORT || 5000;
 
-mongoose
-  .connect(process.env.MONGODB_URI)
+initDB()
   .then(() => {
-    console.log('Connected to MongoDB');
-    app.listen(PORT, () => console.log(`Traject backend running on http://localhost:${PORT}`));
+    app.listen(PORT, () =>
+      console.log(`Traject backend running on http://localhost:${PORT}`)
+    );
   })
   .catch((err) => {
-    console.error('MongoDB connection failed:', err.message);
+    console.error('MySQL connection / table init failed:', err.message);
     process.exit(1);
   });
