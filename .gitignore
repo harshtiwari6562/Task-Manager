@@ -8,6 +8,12 @@ node_modules/
 !.env.example
 !**/.env.example
 
+# SQLite Database files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+
 # Production builds
 dist/
 build/
@@ -24,3 +30,12 @@ pnpm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# SSL / TLS certificates & keys (mkcert, local certs)
+*.pem
+*.crt
+*.key
+*.pfx
+*.p12
+certs/
+

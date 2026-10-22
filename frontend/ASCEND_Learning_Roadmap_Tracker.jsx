@@ -5,6 +5,8 @@ import {
   Flame, Sparkles, ArrowRight, Settings, Plus, Trash2, RotateCcw, X, Shield, Calendar, Clock, Bell, BellRing, Check, Copy, Layers, CalendarDays, MoreVertical, Mic, SlidersHorizontal, FileText, Download, Filter, XCircle, User, Heart, Moon, HelpCircle, LogOut, Menu, Edit3, Target, Flag
 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell, ResponsiveContainer, PieChart, Pie, Legend } from 'recharts';
+import { API_BASE, authApi, dataApi, aiApi } from './src/api.js';
+import { requestNotificationPermission, startReminderWatcher } from './src/reminders/reminderService.js';
 
 /* ---------------------------------- THEME ---------------------------------- */
 const COLORS = {
@@ -29,59 +31,242 @@ const APP_START_DATE = '2026-08-26';
 const SpeechRecognition = typeof window !== 'undefined' ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
 const HAS_SPEECH_RECOGNITION = !!SpeechRecognition;
 
+// Single shared SpeechRecognition manager to eliminate instantiation lag and reuse one audio session
+class SpeechRecognitionManager {
+  constructor() {
+    this.recognition = null;
+    this.activeListener = null;
+    this.isListening = false;
+  }
+
+  getInstance() {
+    if (!SpeechRecognition) return null;
+    if (!this.recognition) {
+      try {
+        const rec = new SpeechRecognition();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = 'en-IN'; // English (India) — captures English & Indian accents in Latin script, never Devanagari
+
+        rec.onstart = () => {
+          this.isListening = true;
+          if (this.activeListener?.onStart) this.activeListener.onStart();
+        };
+
+        rec.onresult = (event) => {
+          if (this.activeListener?.onResult) this.activeListener.onResult(event);
+        };
+
+        rec.onerror = (event) => {
+          if (this.activeListener?.onError) this.activeListener.onError(event);
+        };
+
+        rec.onend = () => {
+          this.isListening = false;
+          if (this.activeListener?.onEnd) this.activeListener.onEnd();
+        };
+
+        this.recognition = rec;
+      } catch (err) {
+        console.warn('[Speech] Init error:', err);
+        return null;
+      }
+    }
+    return this.recognition;
+  }
+
+  start(listener) {
+    const rec = this.getInstance();
+    if (!rec) return false;
+
+    if (this.isListening) {
+      try { rec.abort(); } catch {}
+    }
+
+    this.activeListener = listener;
+    try {
+      rec.start();
+      return true;
+    } catch {
+      try {
+        rec.abort();
+        rec.start();
+        return true;
+      } catch (e) {
+        console.warn('[Speech] Start failed:', e);
+        return false;
+      }
+    }
+  }
+
+  stop(callerListener = null) {
+    if (callerListener && this.activeListener !== callerListener) return;
+    if (this.recognition && this.isListening) {
+      try { this.recognition.stop(); } catch {}
+    }
+    this.isListening = false;
+  }
+
+  abort(callerListener = null) {
+    if (callerListener && this.activeListener !== callerListener) return;
+    if (this.recognition) {
+      try { this.recognition.abort(); } catch {}
+    }
+    this.isListening = false;
+  }
+}
+
+const sharedSpeechManager = new SpeechRecognitionManager();
+
+
+// Helper to escape HTML and prevent Stored XSS in reports & prints
+export function escapeHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 /* ----------------------------- STORAGE HELPER ----------------------------- */
+// In-memory buffer for unsaved changes during temporary network drops
+const inMemoryStore = new Map();
+// Cache of last persisted string values to eliminate redundant PUT requests
+const lastPersistedValues = new Map();
+// Active debounce timers per key (~800ms debounce to batch writes)
+const pendingSaveTimers = new Map();
+const pendingSaveValues = new Map();
+
 const storageHelper = {
   async get(key) {
+    if (pendingSaveValues.has(key)) {
+      return { value: pendingSaveValues.get(key) };
+    }
+    if (inMemoryStore.has(key)) {
+      return { value: inMemoryStore.get(key) };
+    }
     if (window.storage?.get) {
       try {
-        const res = await window.storage.get(key, false);
-        if (res) return res;
+        const res = await window.storage.get(key);
+        if (res !== null && res !== undefined) {
+          if (res.value !== undefined) {
+            lastPersistedValues.set(key, res.value);
+          }
+          return res;
+        }
+        return null;
       } catch (e) {
-        console.warn('window.storage.get error:', e);
+        console.warn('[Storage] window.storage.get error:', e);
+        return null;
       }
     }
     try {
       const val = localStorage.getItem(key);
+      if (val !== null) lastPersistedValues.set(key, val);
       return val !== null ? { value: val } : null;
     } catch {
       return null;
     }
   },
+
   async set(key, value) {
-    if (window.storage?.set) {
-      try {
-        await window.storage.set(key, value, false);
-        return;
-      } catch (e) {
-        console.warn('window.storage.set error:', e);
+    // 1. Skip save if value did not change from what was already persisted
+    if (lastPersistedValues.get(key) === value && !pendingSaveValues.has(key)) {
+      return;
+    }
+
+    // 2. Update memory buffer immediately so UI reflects change synchronously
+    inMemoryStore.set(key, value);
+    pendingSaveValues.set(key, value);
+
+    // 3. Debounce network write by ~800ms to batch rapid UI mutations
+    if (pendingSaveTimers.has(key)) {
+      clearTimeout(pendingSaveTimers.get(key));
+    }
+
+    return new Promise((resolve) => {
+      const timer = setTimeout(async () => {
+        pendingSaveTimers.delete(key);
+        const valToSave = pendingSaveValues.get(key);
+        pendingSaveValues.delete(key);
+
+        if (valToSave === undefined) return resolve();
+        if (lastPersistedValues.get(key) === valToSave) return resolve();
+
+        if (window.storage?.set) {
+          try {
+            await window.storage.set(key, valToSave);
+            lastPersistedValues.set(key, valToSave);
+            inMemoryStore.delete(key);
+          } catch (e) {
+            console.warn('[Storage] window.storage.set failed. Buffered in memory:', e);
+            inMemoryStore.set(key, valToSave);
+          }
+        } else {
+          try {
+            localStorage.setItem(key, valToSave);
+            lastPersistedValues.set(key, valToSave);
+          } catch (e) {
+            console.error('Failed to write to localStorage:', e);
+          }
+        }
+        resolve();
+      }, 800);
+
+      pendingSaveTimers.set(key, timer);
+    });
+  },
+
+  async flush() {
+    // Immediate synchronous-flush before page unload
+    for (const [key, timer] of pendingSaveTimers.entries()) {
+      clearTimeout(timer);
+      const val = pendingSaveValues.get(key);
+      if (val !== undefined && window.storage?.set) {
+        try {
+          window.storage.set(key, val);
+          lastPersistedValues.set(key, val);
+        } catch {}
       }
     }
-    try {
-      localStorage.setItem(key, value);
-    } catch (e) {
-      console.error('Failed to write to localStorage:', e);
-    }
+    pendingSaveTimers.clear();
+    pendingSaveValues.clear();
   },
+
   async delete(key) {
+    if (pendingSaveTimers.has(key)) {
+      clearTimeout(pendingSaveTimers.get(key));
+      pendingSaveTimers.delete(key);
+    }
+    pendingSaveValues.delete(key);
+    lastPersistedValues.delete(key);
+    inMemoryStore.delete(key);
+
     if (window.storage?.delete) {
       try {
-        await window.storage.delete(key, false);
+        await window.storage.delete(key);
         return;
       } catch (e) {
-        console.warn('window.storage.delete error:', e);
+        console.warn('[Storage] window.storage.delete error:', e);
+        return;
       }
     }
     try {
       localStorage.removeItem(key);
     } catch {}
   },
+
   async list(prefix) {
     if (window.storage?.list) {
       try {
-        const res = await window.storage.list(prefix, false);
+        const res = await window.storage.list(prefix);
         if (res) return res;
+        return { keys: [] };
       } catch (e) {
-        console.warn('window.storage.list error:', e);
+        console.warn('[Storage] window.storage.list error:', e);
+        return { keys: [] };
       }
     }
     try {
@@ -98,6 +283,12 @@ const storageHelper = {
     }
   }
 };
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', () => {
+    storageHelper.flush();
+  });
+}
 
 /* ------------------------------- ROADMAP DATA ------------------------------- */
 const ICON_MAP = {
@@ -193,9 +384,9 @@ function getDayStatus(done, total) {
 
 const STATUS_META = {
   superb: { label: 'Superb (100% Win)', color: '#16A34A', bg: '#DCFCE7', border: '#86EFAC', text: '#15803D' },
-  good:   { label: 'Good (Partial)', color: '#F59E0B', bg: '#FEF3C7', border: '#FDE047', text: '#B45309' },
-  bad:    { label: 'Bad (Waste Day)', color: '#EF4444', bg: '#FEE2E2', border: '#FCA5A5', text: '#B91C1C' },
-  rest:   { label: 'Rest Day', color: '#94A3B8', bg: '#F1F5F9', border: '#CBD5E1', text: '#475569' },
+  good: { label: 'Good (Partial)', color: '#F59E0B', bg: '#FEF3C7', border: '#FDE047', text: '#B45309' },
+  bad: { label: 'Bad (Waste Day)', color: '#EF4444', bg: '#FEE2E2', border: '#FCA5A5', text: '#B91C1C' },
+  rest: { label: 'Rest Day', color: '#94A3B8', bg: '#F1F5F9', border: '#CBD5E1', text: '#475569' },
 };
 
 /* ------------------------------ UI PRIMITIVES ------------------------------ */
@@ -302,28 +493,28 @@ function SkillCard({ skill, percent, onClick, onEdit, onDelete }) {
               >
                 <MoreVertical size={16} />
               </button>
-            {showMenu && (
-              <>
-                <div className="fixed inset-0 z-10" onClick={() => setShowMenu(false)} />
-                <div className="absolute right-0 top-8 z-20 bg-white rounded-xl shadow-lg border border-slate-200 py-1 min-w-[110px]">
-                  <button
-                    onClick={() => { setShowMenu(false); onEdit(skill); }}
-                    className="w-full px-3 py-1.5 text-left text-xs font-semibold text-slate-700 hover:bg-slate-50 flex items-center gap-2 cursor-pointer"
-                  >
-                    <Settings size={13} /> Edit
-                  </button>
-                  <button
-                    onClick={() => { setShowMenu(false); onDelete(skill.id); }}
-                    className="w-full px-3 py-1.5 text-left text-xs font-semibold text-red-600 hover:bg-red-50 flex items-center gap-2 cursor-pointer"
-                  >
-                    <Trash2 size={13} /> Delete
-                  </button>
-                </div>
-              </>
-            )}
+              {showMenu && (
+                <>
+                  <div className="fixed inset-0 z-10" onClick={() => setShowMenu(false)} />
+                  <div className="absolute right-0 top-8 z-20 bg-white rounded-xl shadow-lg border border-slate-200 py-1 min-w-[110px]">
+                    <button
+                      onClick={() => { setShowMenu(false); onEdit(skill); }}
+                      className="w-full px-3 py-1.5 text-left text-xs font-semibold text-slate-700 hover:bg-slate-50 flex items-center gap-2 cursor-pointer"
+                    >
+                      <Settings size={13} /> Edit
+                    </button>
+                    <button
+                      onClick={() => { setShowMenu(false); onDelete(skill.id); }}
+                      className="w-full px-3 py-1.5 text-left text-xs font-semibold text-red-600 hover:bg-red-50 flex items-center gap-2 cursor-pointer"
+                    >
+                      <Trash2 size={13} /> Delete
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         </div>
-      </div>
         <div style={{ fontFamily: 'Fraunces, serif', color: COLORS.ink }} className="font-bold text-base sm:text-lg mb-1 leading-snug">
           {skill.name}
         </div>
@@ -331,7 +522,7 @@ function SkillCard({ skill, percent, onClick, onEdit, onDelete }) {
           {skill.tagline}
         </div>
       </div>
-      
+
       <div className="space-y-2 pt-3" style={{ borderTop: `1px dashed ${COLORS.border}` }}>
         <div className="flex items-center justify-between text-xs font-semibold">
           <span style={{ color: COLORS.muted }}>{percent}% complete</span>
@@ -404,9 +595,8 @@ function ProfileDrawer({ isOpen, onClose, view, setView, pendingMissedCount = 0 
                     setView(item.id);
                     onClose();
                   }}
-                  className={`w-full flex items-center gap-3 px-3.5 py-3 rounded-2xl text-xs sm:text-sm font-semibold transition-all text-left cursor-pointer ${
-                    isActive ? 'bg-[#123936] text-amber-300 shadow-xs border border-amber-400/30 font-bold' : 'text-slate-300 hover:bg-white/5'
-                  }`}
+                  className={`w-full flex items-center gap-3 px-3.5 py-3 rounded-2xl text-xs sm:text-sm font-semibold transition-all text-left cursor-pointer ${isActive ? 'bg-[#123936] text-amber-300 shadow-xs border border-amber-400/30 font-bold' : 'text-slate-300 hover:bg-white/5'
+                    }`}
                 >
                   <Icon size={18} className={isActive ? 'text-amber-300' : 'text-emerald-300/70'} />
                   <span>{item.label}</span>
@@ -424,9 +614,8 @@ function ProfileDrawer({ isOpen, onClose, view, setView, pendingMissedCount = 0 
             </div>
             <button
               onClick={() => setDarkMode(!darkMode)}
-              className={`w-10 h-5 flex items-center rounded-full p-0.5 transition-colors cursor-pointer ${
-                darkMode ? 'bg-amber-400 justify-end' : 'bg-slate-600 justify-start'
-              }`}
+              className={`w-10 h-5 flex items-center rounded-full p-0.5 transition-colors cursor-pointer ${darkMode ? 'bg-amber-400 justify-end' : 'bg-slate-600 justify-start'
+                }`}
             >
               <span className="w-4 h-4 rounded-full bg-white shadow-xs" />
             </button>
@@ -467,16 +656,14 @@ function MobileBottomNav({ view, setView }) {
             className="flex flex-col items-center justify-center py-1 px-2 rounded-xl transition-all cursor-pointer min-w-[56px]"
           >
             <div
-              className={`w-9 h-9 rounded-full flex items-center justify-center transition-all ${
-                isActive ? 'bg-[#C79A3E] text-[#123936] shadow-sm scale-105' : 'text-slate-300 hover:text-white'
-              }`}
+              className={`w-9 h-9 rounded-full flex items-center justify-center transition-all ${isActive ? 'bg-[#C79A3E] text-[#123936] shadow-sm scale-105' : 'text-slate-300 hover:text-white'
+                }`}
             >
               <Icon size={18} />
             </div>
             <span
-              className={`text-[10px] mt-0.5 font-medium transition-colors ${
-                isActive ? 'text-[#C79A3E] font-extrabold' : 'text-slate-400'
-              }`}
+              className={`text-[10px] mt-0.5 font-medium transition-colors ${isActive ? 'text-[#C79A3E] font-extrabold' : 'text-slate-400'
+                }`}
             >
               {tab.label}
             </span>
@@ -649,9 +836,8 @@ function DashboardView({ skills, progress, overallPercent, streak, todayPercent,
               <button
                 key={tab.id}
                 onClick={() => setActiveSubTab(tab.id)}
-                className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                  isActive ? 'bg-[#0d2b26] text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
-                }`}
+                className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${isActive ? 'bg-[#0d2b26] text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                  }`}
               >
                 {tab.label}
               </button>
@@ -794,23 +980,197 @@ function DashboardView({ skills, progress, overallPercent, streak, todayPercent,
 }
 
 /* -------------------------------- VOICE MULTI-TASK QUICK ADD -------------------------------- */
+const HINDI_TO_ENGLISH_MAP = {
+  // Sleep / Rest
+  'स्लीपिंग': 'Sleeping',
+  'सोना': 'Sleep',
+  'सोने': 'Sleep',
+  'नींद': 'Sleep',
+  'आराम': 'Rest',
+  'ब्रेक': 'Break',
+  'sona': 'Sleep',
+  'so jana': 'Sleep',
+  'neend': 'Sleep',
+  'aaram': 'Rest',
+
+  // Fitness / Health
+  'जिम': 'Gym',
+  'कसरत': 'Workout',
+  'व्यायाम': 'Exercise',
+  'दौड़ना': 'Running',
+  'रनिंग': 'Running',
+  'टहलना': 'Walk',
+  'वॉक': 'Walk',
+  'योगा': 'Yoga',
+  'योग': 'Yoga',
+  'ध्यान': 'Meditation',
+  'gym': 'Gym',
+  'kasrat': 'Workout',
+  'running': 'Running',
+  'tahalna': 'Walk',
+  'walk': 'Walk',
+  'yoga': 'Yoga',
+  'dhyan': 'Meditation',
+
+  // Education / Study
+  'कॉलेज': 'College',
+  'स्कूल': 'School',
+  'पढ़ाई': 'Study',
+  'पढ़ना': 'Study',
+  'अध्ययन': 'Study',
+  'कोडिंग': 'Coding',
+  'प्रोग्रामिंग': 'Programming',
+  'रिवीजन': 'Revision',
+  'असाइनमेंट': 'Assignment',
+  'होमवर्क': 'Homework',
+  'क्लास': 'Class',
+  'ट्यूशन': 'Tuition',
+  'coaching': 'Coaching',
+  'college': 'College',
+  'padhai': 'Study',
+  'padhna': 'Study',
+  'coding': 'Coding',
+  'revision': 'Revision',
+  'assignment': 'Assignment',
+  'homework': 'Homework',
+
+  // Food / Meals
+  'नाश्ता': 'Breakfast',
+  'ब्रेकफास्ट': 'Breakfast',
+  'खाना': 'Meal',
+  'लंच': 'Lunch',
+  'डिनर': 'Dinner',
+  'चाय': 'Tea Break',
+  'कॉफी': 'Coffee Break',
+  'पानी': 'Drink Water',
+  'nashta': 'Breakfast',
+  'khana': 'Meal',
+  'lunch': 'Lunch',
+  'dinner': 'Dinner',
+  'chai': 'Tea Break',
+  'coffee': 'Coffee Break',
+
+  // Daily Routines
+  'नहाना': 'Freshen Up',
+  'स्नान': 'Shower',
+  'फ्रेश': 'Freshen Up',
+  'फ्रेश होना': 'Freshen Up',
+  'सफाई': 'Cleaning',
+  'कपड़े धोना': 'Laundry',
+  'nahana': 'Freshen Up',
+  'fresh': 'Freshen Up',
+  'fresh hona': 'Freshen Up',
+  'safai': 'Cleaning',
+
+  // Spiritual / Personal
+  'पूजा': 'Prayer',
+  'प्रार्थना': 'Prayer',
+  'मंदिर': 'Temple Visit',
+  'गीता': 'Bhagavad Gita',
+  'भगवद गीता': 'Bhagavad Gita',
+  'आरती': 'Prayer',
+  'puja': 'Prayer',
+  'mandir': 'Temple Visit',
+  'gita': 'Bhagavad Gita',
+  'bhagavad gita': 'Bhagavad Gita',
+
+  // Work / Chores
+  'ऑफिस': 'Office Work',
+  'काम': 'Work',
+  'दफ्तर': 'Office',
+  'प्रोजेक्ट': 'Project Work',
+  'मीटिंग': 'Meeting',
+  'बाजार': 'Market',
+  'मार्केट': 'Market',
+  'खरीदारी': 'Shopping',
+  'दुकान': 'Shopping',
+  'shopping': 'Shopping',
+  'office': 'Office Work',
+  'kaam': 'Work',
+  'project': 'Project Work',
+  'meeting': 'Meeting',
+  'bazar': 'Market',
+  'market': 'Market',
+};
+
+const DEVANAGARI_TRANSLIT = {
+  'अ': 'a', 'आ': 'aa', 'इ': 'i', 'ई': 'ee', 'उ': 'u', 'ऊ': 'oo', 'ऋ': 'ri',
+  'ए': 'e', 'ऐ': 'ai', 'ओ': 'o', 'औ': 'au', 'अं': 'an', 'अः': 'ah',
+  'क': 'k', 'ख': 'kh', 'ग': 'g', 'घ': 'gh', 'ङ': 'ng',
+  'च': 'ch', 'छ': 'chh', 'ज': 'j', 'झ': 'jh', 'ञ': 'ny',
+  'ट': 't', 'ठ': 'th', 'ड': 'd', 'ढ': 'dh', 'ण': 'n',
+  'त': 't', 'थ': 'th', 'द': 'd', 'ध': 'dh', 'न': 'n',
+  'प': 'p', 'फ': 'ph', 'ब': 'b', 'भ': 'bh', 'म': 'm',
+  'य': 'y', 'र': 'r', 'ल': 'l', 'व': 'v', 'श': 'sh', 'ष': 'sh', 'स': 's', 'ह': 'h',
+  'ा': 'a', 'ि': 'i', 'ी': 'ee', 'ु': 'u', 'ू': 'oo', 'ृ': 'ri',
+  'े': 'e', 'ै': 'ai', 'ो': 'o', 'ौ': 'au', 'ं': 'n', 'ँ': 'n', 'ः': 'h',
+  '्': '', '़': '', '।': '', '॥': '', '०': '0', '१': '1', '२': '2', '३': '3',
+  '४': '4', '५': '5', '६': '6', '७': '7', '८': '8', '९': '9'
+};
+
+function transliterateDevanagari(text) {
+  let result = '';
+  for (const char of text) {
+    if (DEVANAGARI_TRANSLIT[char] !== undefined) {
+      result += DEVANAGARI_TRANSLIT[char];
+    } else if (!/[\u0900-\u097F]/.test(char)) {
+      result += char;
+    }
+  }
+  return result;
+}
+
+function translateOrTransliterate(text) {
+  if (!text) return '';
+  const cleanWord = text.replace(/[।.,;!?]/g, '').trim();
+  const lower = cleanWord.toLowerCase();
+  if (HINDI_TO_ENGLISH_MAP[cleanWord]) return HINDI_TO_ENGLISH_MAP[cleanWord];
+  if (HINDI_TO_ENGLISH_MAP[lower]) return HINDI_TO_ENGLISH_MAP[lower];
+
+  const words = cleanWord.split(/\s+/);
+  if (words.length > 1) {
+    const translatedWords = words.map((w) => {
+      const wLower = w.toLowerCase();
+      if (HINDI_TO_ENGLISH_MAP[w]) return HINDI_TO_ENGLISH_MAP[w];
+      if (HINDI_TO_ENGLISH_MAP[wLower]) return HINDI_TO_ENGLISH_MAP[wLower];
+      if (/[\u0900-\u097F]/.test(w)) return transliterateDevanagari(w);
+      return w;
+    });
+    return translatedWords.join(' ');
+  }
+
+  if (/[\u0900-\u097F]/.test(cleanWord)) {
+    const translit = transliterateDevanagari(cleanWord);
+    return translit.charAt(0).toUpperCase() + translit.slice(1);
+  }
+
+  return cleanWord;
+}
+
 function fallbackParseTasks(transcript) {
   if (!transcript || !transcript.trim()) return [];
-  const pattern = /phir|uske\s+baad|after\s+that|and\s+then|then|\baur\b|\band\b|[,.\n;]+/gi;
+  const pattern = /phir|uske\s+baad|after\s+that|and\s+then|then|\baur\b|\band\b|फिर|उसके\s*बाद|और|तथा|[,.\n;।]+/gi;
   const parts = transcript.split(pattern);
   const tasks = parts
     .map((p) => {
       let cleaned = p
-        .replace(/\b(hai|karna|karne|padhna|padhne|jana|jane|hona|hone|matlab|ok|umm|pls|please)\b/gi, '')
+        .replace(/\b(hai|karna|karne|padhna|padhne|jana|jane|hona|hone|matlab|ok|umm|pls|please)\b|है|करना|करने|जाना|जाने|पढ़ना|पढ़ने|होना|होने|मतलब|प्लीज/gi, '')
         .trim();
       if (!cleaned) return '';
-      return cleaned
+
+      const englishText = translateOrTransliterate(cleaned);
+      if (!englishText) return '';
+
+      return englishText
         .split(/\s+/)
         .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
         .join(' ');
     })
     .filter((t) => t.length > 1);
-  return tasks.length > 0 ? tasks : [transcript.trim()];
+
+  if (tasks.length > 0) return tasks;
+  const single = translateOrTransliterate(transcript.trim());
+  return [single.charAt(0).toUpperCase() + single.slice(1)];
 }
 
 function VoiceMultiTaskButton({ onTasksParsed }) {
@@ -818,120 +1178,175 @@ function VoiceMultiTaskButton({ onTasksParsed }) {
   const [transcript, setTranscript] = useState('');
   const [processing, setProcessing] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
-  const recognitionRef = useRef(null);
+
   const fullTranscriptRef = useRef('');
+  const micTapTimeRef = useRef(0);
+  const firstWordsLoggedRef = useRef(false);
+  const silenceTimerRef = useRef(null);
+  const abortControllerRef = useRef(null);
+  const submissionIdRef = useRef(0);
+  const listenerRef = useRef(null);
+  const isSubmittingRef = useRef(false);
 
   useEffect(() => {
     return () => {
-      if (recognitionRef.current) {
-        try { recognitionRef.current.stop(); } catch {}
-      }
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (abortControllerRef.current) abortControllerRef.current.abort();
+      sharedSpeechManager.abort(listenerRef.current);
     };
   }, []);
 
   if (!HAS_SPEECH_RECOGNITION) return null;
 
+  function finishAndSubmit() {
+    if (isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
+
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    sharedSpeechManager.stop(listenerRef.current);
+    setRecording(false);
+
+    const rawText = fullTranscriptRef.current.trim();
+    if (!rawText) {
+      isSubmittingRef.current = false;
+      return;
+    }
+
+    const transcriptEndTime = performance.now();
+
+    // Cancel any previous in-flight AI request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+
+    // 1. INSTANT LOCAL RESULT: Show tasks immediately (< 50ms) - Never block UI on network!
+    const localTasks = fallbackParseTasks(rawText);
+    if (localTasks && localTasks.length > 0) {
+      onTasksParsed(localTasks);
+      const instantDuration = Math.round(performance.now() - transcriptEndTime);
+      console.log(`[Voice Timing] transcript end -> tasks shown: ${instantDuration}ms (instant local fallback)`);
+    }
+
+    // 2. BACKGROUND AI PARSING (max 4s timeout) - upgrades tasks if it arrives within 4s
+    const currentSubId = ++submissionIdRef.current;
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    setProcessing(true);
+
+    const aiTimeout = setTimeout(() => controller.abort(), 4000);
+
+    aiApi.parseTasks(rawText, { signal: controller.signal })
+      .then((data) => {
+        clearTimeout(aiTimeout);
+        // Only update if user hasn't started a new voice session
+        if (submissionIdRef.current !== currentSubId) return;
+
+        const aiTasks = data?.tasks;
+        if (Array.isArray(aiTasks) && aiTasks.length > 0) {
+          onTasksParsed(aiTasks);
+          const aiUpgradeDuration = Math.round(performance.now() - transcriptEndTime);
+          console.log(`[Voice Timing] AI upgraded tasks after: ${aiUpgradeDuration}ms`);
+        }
+      })
+      .catch((err) => {
+        clearTimeout(aiTimeout);
+        if (err.name !== 'AbortError') {
+          console.warn('[Voice Multi-Task] AI background parsing fallback preserved:', err.message);
+        }
+      })
+      .finally(() => {
+        if (submissionIdRef.current === currentSubId) {
+          setProcessing(false);
+          setTranscript('');
+          fullTranscriptRef.current = '';
+        }
+        isSubmittingRef.current = false;
+      });
+  }
+
   function startRecording() {
     setErrorMsg('');
     setTranscript('');
     fullTranscriptRef.current = '';
+    micTapTimeRef.current = performance.now();
+    firstWordsLoggedRef.current = false;
+    isSubmittingRef.current = false;
 
-    try {
-      const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SpeechRec) {
-        setErrorMsg('Microphone access unavailable in this browser.');
-        return;
-      }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
 
-      const recognition = new SpeechRec();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'hi-IN';
-
-      recognition.onstart = () => {
+    listenerRef.current = {
+      onStart: () => {
         setRecording(true);
-      };
-
-      recognition.onresult = (event) => {
-        let current = '';
+      },
+      onResult: (event) => {
+        let interim = '';
+        let final = '';
         for (let i = 0; i < event.results.length; i++) {
-          if (event.results[i] && event.results[i][0]) {
-            current += event.results[i][0].transcript + ' ';
+          const item = event.results[i];
+          if (item && item[0]) {
+            if (item.isFinal) {
+              final += item[0].transcript + ' ';
+            } else {
+              interim += item[0].transcript + ' ';
+            }
           }
         }
-        fullTranscriptRef.current = current.trim();
-        setTranscript(fullTranscriptRef.current);
-      };
+        const currentText = (final + interim).trim();
+        fullTranscriptRef.current = currentText;
+        setTranscript(currentText);
 
-      recognition.onerror = (e) => {
+        if (!firstWordsLoggedRef.current && currentText) {
+          firstWordsLoggedRef.current = true;
+          const firstWordsDuration = Math.round(performance.now() - micTapTimeRef.current);
+          console.log(`[Voice Timing] mic tap -> first words shown: ${firstWordsDuration}ms`);
+        }
+
+        // Auto-stop and auto-submit after ~1.2 s of silence (no extra button press needed)
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        if (currentText) {
+          silenceTimerRef.current = setTimeout(() => {
+            finishAndSubmit();
+          }, 1200);
+        }
+      },
+      onError: (e) => {
         console.warn('Voice Multi-Task Speech error:', e);
         if (e.error === 'not-allowed' || e.error === 'permission-denied') {
-          setErrorMsg('Microphone access denied. Please allow microphone permission.');
+          setErrorMsg('Microphone access denied. Please click the lock/tune icon in your address bar and set Microphone to "Allow".');
+        } else if (e.error !== 'no-speech' && e.error !== 'aborted') {
+          setErrorMsg(`Voice input error (${e.error || 'Please try again'}).`);
         }
         setRecording(false);
-      };
-
-      recognition.onend = () => {
+      },
+      onEnd: () => {
         setRecording(false);
-        if (fullTranscriptRef.current.trim()) {
-          processTranscript(fullTranscriptRef.current.trim());
+        // If not already submitted via silence timer and text exists, submit
+        if (fullTranscriptRef.current.trim() && !isSubmittingRef.current) {
+          finishAndSubmit();
         }
-      };
+      },
+    };
 
-      recognitionRef.current = recognition;
-      recognition.start();
-    } catch (e) {
-      console.warn('Start voice recording failed:', e);
-      setErrorMsg('Microphone error. Please try again.');
+    const started = sharedSpeechManager.start(listenerRef.current);
+    if (!started) {
+      setErrorMsg('Microphone unavailable or in use. Please check browser permissions.');
       setRecording(false);
     }
   }
 
   function stopRecording() {
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch {}
-    }
-    setRecording(false);
-  }
-
-  async function processTranscript(rawText) {
-    if (!rawText || !rawText.trim()) {
-      setErrorMsg('Kuch sunayi nahi diya, dobara try karein');
-      return;
-    }
-
-    setProcessing(true);
-    try {
-      const token = window.__authToken || localStorage.getItem('traject_token') || '';
-      const BASE = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
-      const res = await fetch(`${BASE}/ai/parse-tasks`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ transcript: rawText }),
-      });
-      const data = await res.json();
-      let parsed = data?.tasks;
-      if (!Array.isArray(parsed) || parsed.length === 0) {
-        parsed = fallbackParseTasks(rawText);
-      }
-      if (parsed && parsed.length > 0) {
-        onTasksParsed(parsed);
-      } else {
-        setErrorMsg('Kuch sunayi nahi diya, dobara try karein');
-      }
-    } catch (err) {
-      console.warn('AI task parsing failed, using fallback:', err);
-      const fallback = fallbackParseTasks(rawText);
-      if (fallback && fallback.length > 0) {
-        onTasksParsed(fallback);
-      } else {
-        setErrorMsg('Kuch sunayi nahi diya, dobara try karein');
-      }
-    } finally {
-      setProcessing(false);
-      setTranscript('');
-      fullTranscriptRef.current = '';
-    }
+    finishAndSubmit();
   }
 
   return (
@@ -940,16 +1355,15 @@ function VoiceMultiTaskButton({ onTasksParsed }) {
         type="button"
         onClick={recording ? stopRecording : startRecording}
         disabled={processing}
-        className={`w-full py-3 px-4 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 transition-all cursor-pointer shadow-md ${
-          recording
-            ? 'bg-red-600 text-white ring-4 ring-red-300 animate-pulse'
-            : 'bg-red-500 text-white hover:bg-red-600 active:scale-95'
-        }`}
+        className={`w-full py-3 px-4 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 transition-all cursor-pointer shadow-md ${recording
+          ? 'bg-red-600 text-white ring-4 ring-red-300 animate-pulse'
+          : 'bg-red-500 text-white hover:bg-red-600 active:scale-95'
+          }`}
         style={{
           background: recording ? '#DC2626' : 'linear-gradient(135deg, #EF4444 0%, #B91C1C 100%)',
           boxShadow: recording ? '0 0 20px rgba(239, 68, 68, 0.6)' : '0 4px 12px rgba(239, 68, 68, 0.25)',
         }}
-        title={recording ? 'Tap to finish voice recording' : 'Voice Quick Add — Speak full day plan'}
+        title={recording ? 'Speaking... (Auto-stops after 1.2s silence)' : 'Voice Quick Add — Speak full day plan'}
       >
         <div className="relative flex items-center justify-center">
           <Mic size={16} className={recording ? 'animate-bounce' : ''} />
@@ -958,7 +1372,7 @@ function VoiceMultiTaskButton({ onTasksParsed }) {
           )}
         </div>
         <span className="truncate">
-          {recording ? 'Stop Recording (Processing Tasks) ⏹' : '🎙 Voice Quick Add (Say All Tasks)'}
+          {recording ? 'Listening... (auto-stops on silence) ⏹' : '🎙 Voice Quick Add (Say All Tasks)'}
         </span>
       </button>
 
@@ -966,7 +1380,7 @@ function VoiceMultiTaskButton({ onTasksParsed }) {
         <div className="p-2.5 rounded-xl bg-red-50 border border-red-200 space-y-1">
           <div className="flex items-center gap-1.5 text-[11px] font-bold text-red-700">
             <span className="w-2 h-2 rounded-full bg-red-600 animate-ping shrink-0" />
-            <span>Listening... Speak day plan ("Gym, phir college, uske baad SQL...")</span>
+            <span>Listening... Speak tasks in English ("Gym, college, SQL study...")</span>
           </div>
           {transcript && (
             <div className="text-[11px] text-red-900 bg-white p-2 rounded-lg border border-red-100 italic truncate max-h-16 overflow-y-auto">
@@ -1234,6 +1648,7 @@ function AddNewTaskModal({ isOpen, onClose, onAddTask, skills = [] }) {
   const [priority, setPriority] = useState('Medium'); // 'Low', 'Medium', 'High'
   const [time, setTime] = useState('');
   const [notes, setNotes] = useState('');
+  const [voiceDrafts, setVoiceDrafts] = useState([]);
 
   if (!isOpen) return null;
 
@@ -1292,18 +1707,16 @@ function AddNewTaskModal({ isOpen, onClose, onAddTask, skills = [] }) {
           <button
             type="button"
             onClick={() => setActiveTab('manual')}
-            className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-              activeTab === 'manual' ? 'bg-[#0d2b26] text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
-            }`}
+            className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${activeTab === 'manual' ? 'bg-[#0d2b26] text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
           >
             <Edit3 size={15} /> Manual Add
           </button>
           <button
             type="button"
             onClick={() => setActiveTab('voice')}
-            className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-              activeTab === 'voice' ? 'bg-[#0d2b26] text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
-            }`}
+            className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${activeTab === 'voice' ? 'bg-[#0d2b26] text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
           >
             <Mic size={15} /> Voice Add
           </button>
@@ -1344,11 +1757,10 @@ function AddNewTaskModal({ isOpen, onClose, onAddTask, skills = [] }) {
                       key={cat.id}
                       type="button"
                       onClick={() => setCategory(cat.label)}
-                      className={`flex items-center gap-1.5 px-3.5 py-2 rounded-2xl text-xs font-semibold whitespace-nowrap transition-all border cursor-pointer ${
-                        isSelected
-                          ? 'bg-[#0d2b26] text-white border-[#0d2b26] shadow-xs'
-                          : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
-                      }`}
+                      className={`flex items-center gap-1.5 px-3.5 py-2 rounded-2xl text-xs font-semibold whitespace-nowrap transition-all border cursor-pointer ${isSelected
+                        ? 'bg-[#0d2b26] text-white border-[#0d2b26] shadow-xs'
+                        : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+                        }`}
                     >
                       <Icon size={14} className={isSelected ? 'text-amber-300' : 'text-slate-500'} />
                       <span>{cat.label}</span>
@@ -1389,9 +1801,8 @@ function AddNewTaskModal({ isOpen, onClose, onAddTask, skills = [] }) {
                       key={p.id}
                       type="button"
                       onClick={() => setPriority(p.id)}
-                      className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-2xl text-xs font-bold border transition-all cursor-pointer ${
-                        isSel ? `${p.bg} ${p.text} ${p.border} ring-1 ring-current` : 'bg-slate-50 text-slate-600 border-slate-200'
-                      }`}
+                      className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-2xl text-xs font-bold border transition-all cursor-pointer ${isSel ? `${p.bg} ${p.text} ${p.border} ring-1 ring-current` : 'bg-slate-50 text-slate-600 border-slate-200'
+                        }`}
                     >
                       <span className={`w-2 h-2 rounded-full ${p.dot}`} />
                       {p.label}
@@ -1441,18 +1852,99 @@ function AddNewTaskModal({ isOpen, onClose, onAddTask, skills = [] }) {
             </div>
           </form>
         ) : (
-          <div className="space-y-4 text-center py-4">
-            <p className="text-xs text-slate-600">Speak all your tasks in one go (e.g. "College, Gym at 6pm, Read OS Notes").</p>
-            <div className="flex justify-center">
-              <VoiceMultiTaskButton
-                onTasksParsed={(tasks) => {
-                  if (typeof onAddTask === 'function') {
-                    tasks.forEach((t) => onAddTask({ title: typeof t === 'string' ? t : t.title, skill: 'personal' }));
-                  }
-                  onClose();
-                }}
-              />
-            </div>
+          <div className="py-2">
+            {voiceDrafts.length === 0 ? (
+              <div className="space-y-4 text-center py-4">
+                <p className="text-xs text-slate-600 font-medium">
+                  Speak all your tasks in one go (e.g. "College, Gym at 6pm, Read OS Notes").
+                </p>
+                <div className="flex justify-center">
+                  <VoiceMultiTaskButton
+                    onTasksParsed={(tasks) => {
+                      setVoiceDrafts(tasks.map((t) => (typeof t === 'string' ? t : t.title || '')));
+                    }}
+                  />
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between border-b pb-2" style={{ borderColor: COLORS.border }}>
+                  <div>
+                    <div className="text-xs font-bold flex items-center gap-1.5" style={{ color: COLORS.ink }}>
+                      <Sparkles size={14} className="text-amber-500" /> Confirm Tasks ({voiceDrafts.filter((t) => t.trim()).length})
+                    </div>
+                    <p className="text-[11px] text-slate-500">Edit any title or delete tasks before adding to Today.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setVoiceDrafts([])}
+                    className="text-[11px] font-semibold text-slate-500 hover:text-slate-800 underline cursor-pointer"
+                  >
+                    Re-record
+                  </button>
+                </div>
+
+                <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                  {voiceDrafts.map((taskText, idx) => (
+                    <div key={idx} className="flex items-center gap-2 bg-slate-50 p-2 rounded-xl border border-slate-200">
+                      <span className="text-xs font-bold text-slate-400 w-5 text-right shrink-0">{idx + 1}.</span>
+                      <input
+                        type="text"
+                        value={taskText}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setVoiceDrafts((prev) => prev.map((item, i) => (i === idx ? val : item)));
+                        }}
+                        placeholder="Task title..."
+                        className="flex-1 text-xs font-semibold px-2.5 py-1.5 rounded-lg outline-none bg-white border border-slate-200 focus:border-[#0d2b26]"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setVoiceDrafts((prev) => prev.filter((_, i) => i !== idx))}
+                        className="p-1.5 text-slate-400 hover:text-red-500 rounded-lg hover:bg-red-50 cursor-pointer shrink-0"
+                        title="Remove task"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setVoiceDrafts((prev) => [...prev, ''])}
+                  className="flex items-center gap-1 text-xs font-bold px-3 py-1.5 rounded-xl bg-amber-50 text-amber-800 border border-amber-300 hover:bg-amber-100 cursor-pointer"
+                >
+                  <Plus size={13} /> Add Another Task Item
+                </button>
+
+                <div className="flex justify-end gap-2 pt-3 border-t" style={{ borderColor: COLORS.border }}>
+                  <button
+                    type="button"
+                    onClick={() => setVoiceDrafts([])}
+                    className="px-3.5 py-2 rounded-xl text-xs font-semibold bg-slate-100 text-slate-600 hover:bg-slate-200 cursor-pointer"
+                  >
+                    Clear
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const valid = voiceDrafts.map((t) => t.trim()).filter(Boolean);
+                      if (valid.length > 0 && typeof onAddTask === 'function') {
+                        valid.forEach((t) => onAddTask({ title: t, skill: 'personal', priority: 'Medium' }));
+                        setVoiceDrafts([]);
+                        onClose();
+                      }
+                    }}
+                    disabled={voiceDrafts.filter((t) => t.trim()).length === 0}
+                    className="px-4 py-2 rounded-xl text-xs font-bold shadow-xs cursor-pointer transition-all hover:scale-[1.02]"
+                    style={{ background: COLORS.gold, color: COLORS.tealDeep, opacity: voiceDrafts.filter((t) => t.trim()).length === 0 ? 0.5 : 1 }}
+                  >
+                    Confirm & Add All ({voiceDrafts.filter((t) => t.trim()).length})
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1895,9 +2387,8 @@ function PlannerView({ plannerEvents, onAddEvent, onDeleteEvent, onToggleEvent, 
             <button
               key={id}
               onClick={() => setPlannerTab(id)}
-              className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                isActive ? 'bg-[#0d2b26] text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
+              className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${isActive ? 'bg-[#0d2b26] text-white shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                }`}
             >
               {tab}
             </button>
@@ -1918,11 +2409,10 @@ function PlannerView({ plannerEvents, onAddEvent, onDeleteEvent, onToggleEvent, 
                     setSelectedDayOffset(idx);
                     setSelectedDateKey(item.key);
                   }}
-                  className={`flex flex-col items-center justify-center min-w-[52px] py-2.5 rounded-2xl transition-all cursor-pointer border ${
-                    isSelected
-                      ? 'bg-[#0d2b26] text-white border-[#0d2b26] shadow-md scale-105'
-                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
-                  }`}
+                  className={`flex flex-col items-center justify-center min-w-[52px] py-2.5 rounded-2xl transition-all cursor-pointer border ${isSelected
+                    ? 'bg-[#0d2b26] text-white border-[#0d2b26] shadow-md scale-105'
+                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                    }`}
                 >
                   <span className="text-[11px] font-semibold opacity-80">{item.dayName}</span>
                   <span className={`text-base font-bold mt-0.5 ${isSelected ? 'text-amber-300' : ''}`}>{item.dateNum}</span>
@@ -2035,9 +2525,8 @@ function PlannerView({ plannerEvents, onAddEvent, onDeleteEvent, onToggleEvent, 
                   <button
                     key={dayItem.key}
                     onClick={() => setSelectedDateKey(dayItem.key)}
-                    className={`aspect-square rounded-xl p-1 sm:p-2 flex flex-col items-center justify-between transition-all cursor-pointer relative ${
-                      isSelected ? 'ring-2 ring-emerald-700 shadow-sm' : 'hover:bg-slate-50'
-                    }`}
+                    className={`aspect-square rounded-xl p-1 sm:p-2 flex flex-col items-center justify-between transition-all cursor-pointer relative ${isSelected ? 'ring-2 ring-emerald-700 shadow-sm' : 'hover:bg-slate-50'
+                      }`}
                     style={{
                       background: isSelected ? COLORS.tealDeep : isToday ? COLORS.gold + '22' : COLORS.bg,
                       color: isSelected ? '#F5F3EE' : COLORS.ink,
@@ -2056,6 +2545,86 @@ function PlannerView({ plannerEvents, onAddEvent, onDeleteEvent, onToggleEvent, 
                 );
               })}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add Planner Event Modal */}
+      {showAddForm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl border border-slate-200">
+            <h3 style={{ fontFamily: 'Fraunces, serif', color: COLORS.ink }} className="text-lg font-bold mb-3">
+              Add Planner Event
+            </h3>
+            <form onSubmit={handleCreateEvent} className="space-y-3.5">
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1">Title</label>
+                <input
+                  required
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  placeholder="e.g. System Design Mock"
+                  className="w-full text-xs sm:text-sm px-3.5 py-2 rounded-xl outline-none border border-slate-200 bg-slate-50"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Time</label>
+                  <input
+                    value={time}
+                    onChange={(e) => setTime(e.target.value)}
+                    placeholder="09:00 AM"
+                    className="w-full text-xs sm:text-sm px-3.5 py-2 rounded-xl outline-none border border-slate-200 bg-slate-50"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Category</label>
+                  <select
+                    value={category}
+                    onChange={(e) => setCategory(e.target.value)}
+                    className="w-full text-xs sm:text-sm px-3 py-2 rounded-xl outline-none border border-slate-200 bg-slate-50"
+                  >
+                    <option value="Study">Study</option>
+                    <option value="Work">Work</option>
+                    <option value="Health">Health</option>
+                    <option value="Personal">Personal</option>
+                  </select>
+                </div>
+              </div>
+              <div className="flex items-center justify-between pt-1">
+                <span className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                  <Bell size={14} className="text-amber-600" /> Web Reminder
+                </span>
+                <input
+                  type="checkbox"
+                  checked={enableNotification}
+                  onChange={async (e) => {
+                    const checked = e.target.checked;
+                    setEnableNotification(checked);
+                    if (checked) {
+                      await requestNotificationPermission();
+                    }
+                  }}
+                  className="w-4 h-4 rounded text-emerald-700 cursor-pointer"
+                />
+              </div>
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAddForm(false)}
+                  className="px-3.5 py-1.5 text-xs font-semibold rounded-xl bg-slate-100 hover:bg-slate-200 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-1.5 text-xs font-bold rounded-xl cursor-pointer"
+                  style={{ background: COLORS.gold, color: COLORS.tealDeep }}
+                >
+                  Save Event
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
@@ -2100,171 +2669,213 @@ const PRESET_COLORS = ['#1F6F68', '#C79A3E', '#4E9E93', '#A67C27', '#2D5F5A', '#
 
 function MicButton({ fieldName, currentValue, onAppendText }) {
   const [listening, setListening] = useState(false);
-  const recognitionRef = useRef(null);
   const baseTextRef = useRef('');
+  const micTapTimeRef = useRef(0);
+  const firstWordsLoggedRef = useRef(false);
+  const silenceTimerRef = useRef(null);
+  const listenerRef = useRef(null);
 
   useEffect(() => {
     return () => {
-      if (recognitionRef.current) {
-        try { recognitionRef.current.stop(); } catch {}
-      }
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      sharedSpeechManager.abort(listenerRef.current);
     };
   }, []);
 
   if (!HAS_SPEECH_RECOGNITION) return null;
 
+  function stopListening() {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    sharedSpeechManager.stop(listenerRef.current);
+    setListening(false);
+  }
+
+  function startListening() {
+    baseTextRef.current = currentValue || '';
+    micTapTimeRef.current = performance.now();
+    firstWordsLoggedRef.current = false;
+
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+
+    listenerRef.current = {
+      onStart: () => setListening(true),
+      onResult: (event) => {
+        let interim = '';
+        let final = '';
+        for (let i = 0; i < event.results.length; i++) {
+          const item = event.results[i];
+          if (item && item[0]) {
+            if (item.isFinal) final += item[0].transcript + ' ';
+            else interim += item[0].transcript + ' ';
+          }
+        }
+        const speechText = (final + interim).trim();
+
+        if (!firstWordsLoggedRef.current && speechText) {
+          firstWordsLoggedRef.current = true;
+          const firstWordsDuration = Math.round(performance.now() - micTapTimeRef.current);
+          console.log(`[Voice Timing] mic tap -> first words shown (${fieldName || 'field'}): ${firstWordsDuration}ms`);
+        }
+
+        const base = baseTextRef.current;
+        const newText = base ? `${base.trim()} ${speechText}` : speechText;
+        if (typeof onAppendText === 'function') {
+          onAppendText(newText);
+        }
+
+        // Auto-stop after 1.2s silence
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        if (speechText) {
+          silenceTimerRef.current = setTimeout(() => {
+            stopListening();
+          }, 1200);
+        }
+      },
+      onError: (e) => {
+        if (e.error !== 'no-speech' && e.error !== 'aborted') {
+          console.warn('MicButton speech error:', e);
+        }
+        setListening(false);
+      },
+      onEnd: () => {
+        setListening(false);
+      },
+    };
+
+    const started = sharedSpeechManager.start(listenerRef.current);
+    if (!started) setListening(false);
+  }
+
   function toggleListening() {
     if (listening) {
-      if (recognitionRef.current) {
-        try { recognitionRef.current.stop(); } catch {}
-      }
-      setListening(false);
-      return;
-    }
-
-    try {
-      if (!SpeechRecognition) {
-        setListening(false);
-        return;
-      }
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-
-      baseTextRef.current = currentValue || '';
-
-      recognition.onstart = () => {
-        setListening(true);
-      };
-
-      recognition.onresult = (event) => {
-        try {
-          let transcript = '';
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            if (event.results[i] && event.results[i][0]) {
-              transcript += event.results[i][0].transcript;
-            }
-          }
-          const base = baseTextRef.current;
-          const newText = base ? `${base.trim()} ${transcript.trim()}` : transcript.trim();
-          if (typeof onAppendText === 'function') {
-            onAppendText(newText);
-          }
-        } catch (err) {
-          console.warn('Speech recognition result error:', err);
-        }
-      };
-
-      recognition.onerror = (e) => {
-        console.warn('SpeechRecognition error:', e);
-        setListening(false);
-      };
-
-      recognition.onend = () => {
-        setListening(false);
-      };
-
-      recognitionRef.current = recognition;
-      recognition.start();
-    } catch (e) {
-      console.warn('SpeechRecognition start failed:', e);
-      setListening(false);
+      stopListening();
+    } else {
+      startListening();
     }
   }
 
-  try {
-    return (
-      <button
-        type="button"
-        onClick={toggleListening}
-        className={`p-1.5 rounded-lg transition-all cursor-pointer flex items-center justify-center shrink-0 ${
-          listening
-            ? 'bg-red-500 text-white animate-pulse shadow-xs ring-2 ring-red-300'
-            : 'hover:bg-slate-100 text-slate-400 hover:text-slate-600 border border-slate-200'
+  return (
+    <button
+      type="button"
+      onClick={toggleListening}
+      className={`p-1.5 rounded-lg transition-all cursor-pointer flex items-center justify-center shrink-0 ${listening
+        ? 'bg-red-500 text-white animate-pulse shadow-xs ring-2 ring-red-300'
+        : 'hover:bg-slate-100 text-slate-400 hover:text-slate-600 border border-slate-200'
         }`}
-        title={listening ? 'Stop listening' : `Voice input for ${fieldName || 'field'}`}
-      >
-        <Mic size={14} />
-      </button>
-    );
-  } catch {
-    return null;
-  }
+      title={listening ? 'Listening... (auto-stops on silence)' : `Voice input for ${fieldName || 'field'}`}
+    >
+      <Mic size={14} />
+    </button>
+  );
 }
 
 /**
  * AiMicButton — voice input for the Ascend AI prompt.
- * Listens until the user stops speaking, then auto-submits for generation.
+ * Reuses sharedSpeechManager with interimResults=true, live preview, 1.2s silence auto-stop and auto-submit.
  */
 function AiMicButton({ onTranscript, onAutoSubmit, disabled }) {
   const [listening, setListening] = useState(false);
-  const recognitionRef = useRef(null);
   const finalTranscriptRef = useRef('');
+  const micTapTimeRef = useRef(0);
+  const firstWordsLoggedRef = useRef(false);
+  const silenceTimerRef = useRef(null);
+  const listenerRef = useRef(null);
 
   useEffect(() => {
     return () => {
-      if (recognitionRef.current) {
-        try { recognitionRef.current.stop(); } catch {}
-      }
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      sharedSpeechManager.abort(listenerRef.current);
     };
   }, []);
 
   if (!HAS_SPEECH_RECOGNITION) return null;
 
-  function startListening() {
-    if (disabled || listening) return;
-    try {
-      const recognition = new SpeechRecognition();
-      recognition.continuous = false;      // stop after one utterance
-      recognition.interimResults = true;
-      recognition.lang = 'en-IN';          // works for both Hindi + English
-      finalTranscriptRef.current = '';
+  function stopAndSubmit() {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    sharedSpeechManager.stop(listenerRef.current);
+    setListening(false);
 
-      recognition.onstart = () => setListening(true);
-
-      recognition.onresult = (event) => {
-        let interim = '';
-        let final = '';
-        for (let i = 0; i < event.results.length; i++) {
-          if (event.results[i].isFinal) {
-            final += event.results[i][0].transcript;
-          } else {
-            interim += event.results[i][0].transcript;
-          }
-        }
-        finalTranscriptRef.current = final || interim;
-        if (typeof onTranscript === 'function') {
-          onTranscript(finalTranscriptRef.current);
-        }
-      };
-
-      recognition.onerror = (e) => {
-        console.warn('AiMic error:', e);
-        setListening(false);
-      };
-
-      recognition.onend = () => {
-        setListening(false);
-        // Auto-submit once speech ends if we got a transcript
-        if (finalTranscriptRef.current.trim() && typeof onAutoSubmit === 'function') {
-          onAutoSubmit(finalTranscriptRef.current.trim());
-        }
-      };
-
-      recognitionRef.current = recognition;
-      recognition.start();
-    } catch (e) {
-      console.warn('AiMic start failed:', e);
-      setListening(false);
+    const text = finalTranscriptRef.current.trim();
+    if (text && typeof onAutoSubmit === 'function') {
+      onAutoSubmit(text);
     }
   }
 
-  function stopListening() {
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch {}
+  function startListening() {
+    if (disabled || listening) return;
+
+    finalTranscriptRef.current = '';
+    micTapTimeRef.current = performance.now();
+    firstWordsLoggedRef.current = false;
+
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
     }
-    setListening(false);
+
+    listenerRef.current = {
+      onStart: () => setListening(true),
+      onResult: (event) => {
+        let interim = '';
+        let final = '';
+        for (let i = 0; i < event.results.length; i++) {
+          const item = event.results[i];
+          if (item && item[0]) {
+            if (item.isFinal) final += item[0].transcript + ' ';
+            else interim += item[0].transcript + ' ';
+          }
+        }
+        const currentText = (final + interim).trim();
+        finalTranscriptRef.current = currentText;
+
+        if (!firstWordsLoggedRef.current && currentText) {
+          firstWordsLoggedRef.current = true;
+          const firstWordsDuration = Math.round(performance.now() - micTapTimeRef.current);
+          console.log(`[Voice Timing] mic tap -> first words shown (Skill AI prompt): ${firstWordsDuration}ms`);
+        }
+
+        if (typeof onTranscript === 'function') {
+          onTranscript(currentText);
+        }
+
+        // Auto-stop and auto-submit after 1.2s silence
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        if (currentText) {
+          silenceTimerRef.current = setTimeout(() => {
+            stopAndSubmit();
+          }, 1200);
+        }
+      },
+      onError: (e) => {
+        if (e.error !== 'no-speech' && e.error !== 'aborted') {
+          console.warn('AiMic error:', e);
+        }
+        setListening(false);
+      },
+      onEnd: () => {
+        setListening(false);
+        const text = finalTranscriptRef.current.trim();
+        if (text && typeof onAutoSubmit === 'function') {
+          onAutoSubmit(text);
+        }
+      },
+    };
+
+    const started = sharedSpeechManager.start(listenerRef.current);
+    if (!started) setListening(false);
+  }
+
+  function stopListening() {
+    stopAndSubmit();
   }
 
   return (
@@ -2272,17 +2883,16 @@ function AiMicButton({ onTranscript, onAutoSubmit, disabled }) {
       type="button"
       onClick={listening ? stopListening : startListening}
       disabled={disabled && !listening}
-      className={`flex items-center justify-center shrink-0 transition-all cursor-pointer ${
-        listening
-          ? 'w-9 h-9 rounded-full bg-red-500 text-white shadow-lg ring-4 ring-red-300/60 animate-pulse'
-          : 'w-9 h-9 rounded-xl border-2 text-white hover:scale-105 active:scale-95'
-      }`}
+      className={`flex items-center justify-center shrink-0 transition-all cursor-pointer ${listening
+        ? 'w-9 h-9 rounded-full bg-red-500 text-white shadow-lg ring-4 ring-red-300/60 animate-pulse'
+        : 'w-9 h-9 rounded-xl border-2 text-white hover:scale-105 active:scale-95'
+        }`}
       style={listening ? {} : {
         background: 'linear-gradient(135deg, #1F6F68 0%, #123936 100%)',
         borderColor: '#1F6F68',
         boxShadow: '0 2px 8px rgba(31,111,104,0.30)',
       }}
-      title={listening ? 'Tap to stop — will auto-generate' : 'Speak your skill (auto-generates)'}
+      title={listening ? 'Listening... (auto-stops on silence)' : 'Speak your skill (auto-generates)'}
     >
       <Mic size={15} />
     </button>
@@ -2303,6 +2913,7 @@ function SkillModal({ isOpen, onClose, onSave, editingSkill }) {
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState('');
   const aiSubmitRef = useRef(null); // used by AiMicButton to trigger submit
+  const aiAbortRef = useRef(null);
 
   useEffect(() => {
     if (editingSkill) {
@@ -2327,6 +2938,12 @@ function SkillModal({ isOpen, onClose, onSave, editingSkill }) {
     setAiOpen(false);
     setAiPrompt('');
     setAiError('');
+    return () => {
+      if (aiAbortRef.current) {
+        aiAbortRef.current.abort();
+        aiAbortRef.current = null;
+      }
+    };
   }, [isOpen]);
 
   if (!isOpen) return null;
@@ -2339,23 +2956,15 @@ function SkillModal({ isOpen, onClose, onSave, editingSkill }) {
     if (typeof e === 'string') setAiPrompt(e);
     setAiLoading(true);
     setAiError('');
+
+    if (aiAbortRef.current) {
+      aiAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
+
     try {
-      const token = window.__authToken || localStorage.getItem('traject_token') || '';
-      const BASE = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
-      const res = await fetch(`${BASE}/ai/generate-skill`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ prompt: promptText.trim() }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        const rawMsg = typeof data?.error === 'string' ? data.error : '';
-        const isJsonOr503 = rawMsg.startsWith('{') || rawMsg.includes('503') || rawMsg.includes('UNAVAILABLE') || rawMsg.includes('high demand');
-        const friendlyMsg = isJsonOr503 || !rawMsg
-          ? 'Model abhi busy hai, thodi der baad phir try karein'
-          : rawMsg;
-        throw new Error(friendlyMsg);
-      }
+      const data = await aiApi.generateSkill(promptText.trim(), { signal: controller.signal });
 
       if (data.error === 'unclear_input') {
         throw new Error('Please describe the skill more clearly (e.g. "Power BI for data analytics")');
@@ -2364,7 +2973,7 @@ function SkillModal({ isOpen, onClose, onSave, editingSkill }) {
       if (data.error) {
         const isJsonOr503 = String(data.error).startsWith('{') || String(data.error).includes('503') || String(data.error).includes('UNAVAILABLE');
         const friendlyMsg = isJsonOr503
-          ? 'Model abhi busy hai, thodi der baad phir try karein'
+          ? 'Ascend AI is currently busy. Please try again shortly.'
           : String(data.error);
         throw new Error(friendlyMsg);
       }
@@ -2416,9 +3025,10 @@ function SkillModal({ isOpen, onClose, onSave, editingSkill }) {
       setAiOpen(false);
       setAiPrompt('');
     } catch (err) {
+      if (err.name === 'AbortError') return;
       const msg = err.message || 'Something went wrong. Please try again.';
       const cleanMsg = msg.startsWith('{') || msg.includes('503') || msg.includes('UNAVAILABLE')
-        ? 'Model abhi busy hai, thodi der baad phir try karein'
+        ? 'Ascend AI is currently busy. Please try again shortly.'
         : msg;
       setAiError(cleanMsg);
       setAiOpen(true); // keep open to show error
@@ -2544,9 +3154,8 @@ function SkillModal({ isOpen, onClose, onSave, editingSkill }) {
                     key={iconKey}
                     type="button"
                     onClick={() => setIcon(iconKey)}
-                    className={`p-2.5 rounded-xl border transition-all cursor-pointer flex items-center justify-center ${
-                      isSelected ? 'ring-2 ring-emerald-600 bg-emerald-50' : 'hover:bg-slate-50'
-                    }`}
+                    className={`p-2.5 rounded-xl border transition-all cursor-pointer flex items-center justify-center ${isSelected ? 'ring-2 ring-emerald-600 bg-emerald-50' : 'hover:bg-slate-50'
+                      }`}
                     style={{ borderColor: isSelected ? COLORS.tealMid : COLORS.border }}
                     title={iconKey}
                   >
@@ -2594,11 +3203,10 @@ function SkillModal({ isOpen, onClose, onSave, editingSkill }) {
                         setTargetDays([...targetDays, idx]);
                       }
                     }}
-                    className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all border cursor-pointer ${
-                      isSelected
-                        ? 'bg-teal-900 text-white border-teal-800 shadow-xs'
-                        : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
-                    }`}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all border cursor-pointer ${isSelected
+                      ? 'bg-teal-900 text-white border-teal-800 shadow-xs'
+                      : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+                      }`}
                   >
                     {dayName}
                   </button>
@@ -3019,8 +3627,8 @@ function HistoryView({ historyDays, templates, skillsById, skills, progress }) {
         const acc = totalSteps ? Math.round((doneSteps / totalSteps) * 100) : 0;
         const topicsText = s.steps
           ? s.steps
-              .map((st) => `${st.title} [${map[st.id] ? 'DONE' : 'PENDING'}]`)
-              .join(' ; ')
+            .map((st) => `${st.title} [${map[st.id] ? 'DONE' : 'PENDING'}]`)
+            .join(' ; ')
           : '';
         csvRows.push([`"${s.name}"`, totalSteps, doneSteps, pendingSteps, `${acc}%`, `"${topicsText}"`]);
       });
@@ -3041,27 +3649,27 @@ function HistoryView({ historyDays, templates, skillsById, skills, progress }) {
   function handleDownloadPDF() {
     if (!historyDays || historyDays.length === 0) return;
 
-    const filterLabel = rangeFilter.toUpperCase();
-    const dateStr = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
-    const timeStr = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+    const filterLabel = escapeHtml(rangeFilter.toUpperCase());
+    const dateStr = escapeHtml(new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }));
+    const timeStr = escapeHtml(new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }));
 
     const dailyRowsHtml = rangeDays.map((d) => {
-      const dStr = d.date.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
-      const pending = d.total - d.done;
-      const acc = d.total ? Math.round((d.done / d.total) * 100) : 0;
+      const dStr = escapeHtml(d.date.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }));
+      const pending = escapeHtml(d.total - d.done);
+      const acc = escapeHtml(d.total ? Math.round((d.done / d.total) * 100) : 0);
       const statusKey = getDayStatus(d.done, d.total);
       const meta = STATUS_META[statusKey] || { label: 'N/A', color: '#666', bg: '#f1f5f9', border: '#cbd5e1', text: '#334155' };
 
       return `
         <tr style="border-bottom: 1px solid #e2e8f0;">
           <td style="padding: 9px 12px; font-weight: 600;">${dStr}</td>
-          <td style="padding: 9px 12px; text-align: center;">${d.total} tasks</td>
-          <td style="padding: 9px 12px; text-align: center; font-weight: bold; color: #047857;">${d.done}</td>
+          <td style="padding: 9px 12px; text-align: center;">${escapeHtml(d.total)} tasks</td>
+          <td style="padding: 9px 12px; text-align: center; font-weight: bold; color: #047857;">${escapeHtml(d.done)}</td>
           <td style="padding: 9px 12px; text-align: center; font-weight: bold; color: #dc2626;">${pending}</td>
           <td style="padding: 9px 12px; text-align: center; font-weight: 800; color: #123936;">${acc}%</td>
           <td style="padding: 9px 12px; text-align: center;">
             <span style="background: ${meta.bg}; color: ${meta.text}; border: 1px solid ${meta.border}; padding: 3px 10px; border-radius: 12px; font-size: 10px; font-weight: 800;">
-              ${meta.label}
+              ${escapeHtml(meta.label)}
             </span>
           </td>
         </tr>
@@ -3076,17 +3684,18 @@ function HistoryView({ historyDays, templates, skillsById, skills, progress }) {
         const doneSteps = s.steps ? s.steps.filter((st) => map[st.id]).length : 0;
         const pendingSteps = totalSteps - doneSteps;
         const acc = totalSteps ? Math.round((doneSteps / totalSteps) * 100) : 0;
+        const safeSkillName = escapeHtml(s.name);
         const topicsText = s.steps
-          ? s.steps.map((st) => `<span style="display:inline-block; margin:2px 4px; padding:3px 7px; border-radius:6px; font-size:10px; font-weight:600; background:${map[st.id] ? '#dcfce7; color:#166534; border:1px solid #86efac;' : '#f1f5f9; color:#475569; border:1px solid #cbd5e1;'}">${st.title} (${map[st.id] ? '✓ DONE' : 'PENDING'})</span>`).join('')
+          ? s.steps.map((st) => `<span style="display:inline-block; margin:2px 4px; padding:3px 7px; border-radius:6px; font-size:10px; font-weight:600; background:${map[st.id] ? '#dcfce7; color:#166534; border:1px solid #86efac;' : '#f1f5f9; color:#475569; border:1px solid #cbd5e1;'}">${escapeHtml(st.title)} (${map[st.id] ? '✓ DONE' : 'PENDING'})</span>`).join('')
           : 'No topics registered';
 
         return `
           <tr style="border-bottom: 1px solid #e2e8f0;">
-            <td style="padding: 10px 12px; font-weight: 700; color: #123936;">${s.name}</td>
-            <td style="padding: 10px 12px; text-align: center;">${totalSteps}</td>
-            <td style="padding: 10px 12px; text-align: center; font-weight: bold; color: #047857;">${doneSteps}</td>
-            <td style="padding: 10px 12px; text-align: center; font-weight: bold; color: #dc2626;">${pendingSteps}</td>
-            <td style="padding: 10px 12px; text-align: center; font-weight: 800; color: #123936;">${acc}%</td>
+            <td style="padding: 10px 12px; font-weight: 700; color: #123936;">${safeSkillName}</td>
+            <td style="padding: 10px 12px; text-align: center;">${escapeHtml(totalSteps)}</td>
+            <td style="padding: 10px 12px; text-align: center; font-weight: bold; color: #047857;">${escapeHtml(doneSteps)}</td>
+            <td style="padding: 10px 12px; text-align: center; font-weight: bold; color: #dc2626;">${escapeHtml(pendingSteps)}</td>
+            <td style="padding: 10px 12px; text-align: center; font-weight: 800; color: #123936;">${escapeHtml(acc)}%</td>
             <td style="padding: 10px 12px; font-size: 11px;">${topicsText}</td>
           </tr>
         `;
@@ -3142,19 +3751,19 @@ function HistoryView({ historyDays, templates, skillsById, skills, progress }) {
 
         <div class="summary-grid">
           <div class="summary-card">
-            <div class="val">${rangePercent}%</div>
+            <div class="val">${escapeHtml(rangePercent)}%</div>
             <div class="lbl">Overall Accuracy Rate</div>
           </div>
           <div class="summary-card">
-            <div class="val" style="color: #047857;">${rangeDone} / ${rangePossible}</div>
+            <div class="val" style="color: #047857;">${escapeHtml(rangeDone)} / ${escapeHtml(rangePossible)}</div>
             <div class="lbl">Tasks Done vs Total</div>
           </div>
           <div class="summary-card">
-            <div class="val" style="color: #dc2626;">${rangePossible - rangeDone}</div>
+            <div class="val" style="color: #dc2626;">${escapeHtml(rangePossible - rangeDone)}</div>
             <div class="lbl">Pending Tasks</div>
           </div>
           <div class="summary-card">
-            <div class="val" style="color: #047857;">${statusCounts.superb || 0}d</div>
+            <div class="val" style="color: #047857;">${escapeHtml(statusCounts.superb || 0)}d</div>
             <div class="lbl">Superb (100% Win) Days</div>
           </div>
         </div>
@@ -3230,27 +3839,24 @@ function HistoryView({ historyDays, templates, skillsById, skills, progress }) {
             <button
               type="button"
               onClick={() => setRangeFilter('weekly')}
-              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                rangeFilter === 'weekly' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
-              }`}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${rangeFilter === 'weekly' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+                }`}
             >
               Weekly (7d)
             </button>
             <button
               type="button"
               onClick={() => setRangeFilter('monthly')}
-              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                rangeFilter === 'monthly' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
-              }`}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${rangeFilter === 'monthly' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+                }`}
             >
               Monthly View
             </button>
             <button
               type="button"
               onClick={() => setRangeFilter('yearly')}
-              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                rangeFilter === 'yearly' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
-              }`}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${rangeFilter === 'yearly' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+                }`}
             >
               Yearly (All-Time)
             </button>
@@ -3652,17 +4258,15 @@ function ScheduleView({ templates, onUpdateTemplate, onToggleDayAssignment, onRe
         <div className="flex items-center gap-1.5 p-1 bg-slate-200/80 rounded-2xl text-xs font-bold">
           <button
             onClick={() => setViewMode('group')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl transition-all cursor-pointer ${
-              viewMode === 'group' ? 'bg-white text-teal-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-            }`}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl transition-all cursor-pointer ${viewMode === 'group' ? 'bg-white text-teal-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
           >
             <Layers size={14} /> Group Schedule Pairs
           </button>
           <button
             onClick={() => setViewMode('individual')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl transition-all cursor-pointer ${
-              viewMode === 'individual' ? 'bg-white text-teal-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-            }`}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl transition-all cursor-pointer ${viewMode === 'individual' ? 'bg-white text-teal-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
           >
             <CalendarDays size={14} /> Separate 7 Days
           </button>
@@ -3718,9 +4322,8 @@ function ScheduleView({ templates, onUpdateTemplate, onToggleDayAssignment, onRe
                 onClick={() => {
                   setActiveKey(assignedKey);
                 }}
-                className={`py-2 px-1 rounded-2xl text-center flex flex-col items-center justify-center transition-all cursor-pointer border ${
-                  isSelectedDay ? 'ring-2 ring-emerald-700 font-bold shadow-xs' : ''
-                }`}
+                className={`py-2 px-1 rounded-2xl text-center flex flex-col items-center justify-center transition-all cursor-pointer border ${isSelectedDay ? 'ring-2 ring-emerald-700 font-bold shadow-xs' : ''
+                  }`}
                 style={{
                   background: isSelectedDay ? COLORS.tealDeep : COLORS.card,
                   color: isSelectedDay ? '#F5F3EE' : COLORS.ink,
@@ -3753,7 +4356,7 @@ function ScheduleView({ templates, onUpdateTemplate, onToggleDayAssignment, onRe
         <div className="flex items-center gap-2 flex-wrap">
           {WEEKDAY_NAMES.map((dName, dayIndex) => {
             const isAssignedToThis = (currentTpl.days || []).includes(dayIndex);
-            
+
             const otherAssignedKey = !isAssignedToThis && templateKeys.find((k) => k !== activeKey && (templates[k].days || []).includes(dayIndex));
             const otherAssignedLabel = otherAssignedKey ? templates[otherAssignedKey]?.label?.split(' ')[0] : null;
 
@@ -3761,11 +4364,10 @@ function ScheduleView({ templates, onUpdateTemplate, onToggleDayAssignment, onRe
               <button
                 key={dName}
                 onClick={() => onToggleDayAssignment(activeKey, dayIndex)}
-                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer border ${
-                  isAssignedToThis
-                    ? 'bg-emerald-700 text-white border-emerald-800 shadow-xs scale-105'
-                    : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
-                }`}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer border ${isAssignedToThis
+                  ? 'bg-emerald-700 text-white border-emerald-800 shadow-xs scale-105'
+                  : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+                  }`}
               >
                 {isAssignedToThis ? <Check size={13} color="#FFF" /> : <span className="w-2 h-2 rounded-full bg-slate-300" />}
                 <span>{WEEKDAY_SHORT[dayIndex]}</span>
@@ -3961,8 +4563,6 @@ function AccountSettingsSection() {
   const [deleteMsg, setDeleteMsg] = useState(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
 
-  const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
-
   async function handleChangePassword(e) {
     e.preventDefault();
     setPasswordMsg(null);
@@ -3971,28 +4571,14 @@ function AccountSettingsSection() {
       setPasswordMsg({ type: 'error', text: 'New passwords do not match' });
       return;
     }
-    if (newPassword.length < 6) {
-      setPasswordMsg({ type: 'error', text: 'New password must be at least 6 characters long' });
+    if (newPassword.length < 10) {
+      setPasswordMsg({ type: 'error', text: 'New password must be at least 10 characters long' });
       return;
     }
 
     setPasswordBusy(true);
     try {
-      const token = localStorage.getItem('traject_token');
-      const res = await fetch(`${API_BASE}/auth/password`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: token ? `Bearer ${token}` : '',
-        },
-        body: JSON.stringify({ currentPassword, newPassword }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to update password');
-      }
-
+      await authApi.changePassword(currentPassword, newPassword);
       setPasswordMsg({ type: 'success', text: 'Password updated successfully!' });
       setCurrentPassword('');
       setNewPassword('');
@@ -4015,20 +4601,7 @@ function AccountSettingsSection() {
 
     setDeleteBusy(true);
     try {
-      const token = localStorage.getItem('traject_token');
-      const res = await fetch(`${API_BASE}/auth/account`, {
-        method: 'DELETE',
-        headers: {
-          Authorization: token ? `Bearer ${token}` : '',
-        },
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to delete account');
-      }
-
-      localStorage.removeItem('traject_token');
+      await authApi.deleteAccount();
       if (window.storage) delete window.storage;
       window.location.reload();
     } catch (err) {
@@ -4048,9 +4621,8 @@ function AccountSettingsSection() {
         </div>
 
         {passwordMsg && (
-          <div className={`p-3 rounded-xl text-xs font-semibold ${
-            passwordMsg.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-red-50 text-red-800 border border-red-200'
-          }`}>
+          <div className={`p-3 rounded-xl text-xs font-semibold ${passwordMsg.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-red-50 text-red-800 border border-red-200'
+            }`}>
             {passwordMsg.text}
           </div>
         )}
@@ -4185,33 +4757,29 @@ function SettingsView({
       <div className="flex items-center gap-2 border-b pb-3 flex-wrap" style={{ borderColor: COLORS.border }}>
         <button
           onClick={() => setSubTab('schedule')}
-          className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all cursor-pointer ${
-            subTab === 'schedule' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
-          }`}
+          className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all cursor-pointer ${subTab === 'schedule' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+            }`}
         >
           Weekly Schedule
         </button>
         <button
           onClick={() => setSubTab('display')}
-          className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all cursor-pointer ${
-            subTab === 'display' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
-          }`}
+          className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all cursor-pointer ${subTab === 'display' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+            }`}
         >
           Dashboard Display
         </button>
         <button
           onClick={() => setSubTab('account')}
-          className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all cursor-pointer ${
-            subTab === 'account' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
-          }`}
+          className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all cursor-pointer ${subTab === 'account' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+            }`}
         >
           Account
         </button>
         <button
           onClick={() => setSubTab('data')}
-          className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all cursor-pointer ${
-            subTab === 'data' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
-          }`}
+          className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold transition-all cursor-pointer ${subTab === 'data' ? 'bg-teal-900 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+            }`}
         >
           Data Management
         </button>
@@ -4342,8 +4910,14 @@ export default function App() {
 
   const updateDashboardPrefs = useCallback((newPrefs) => {
     setDashboardPrefs(newPrefs);
-    storageHelper.set('dashboard-prefs', JSON.stringify(newPrefs)).catch(() => {});
+    storageHelper.set('dashboard-prefs', JSON.stringify(newPrefs)).catch(() => { });
   }, []);
+
+  // Web notification scheduler for planner events
+  useEffect(() => {
+    const stopWatcher = startReminderWatcher(() => plannerEvents);
+    return () => stopWatcher();
+  }, [plannerEvents]);
 
   const handleOpenAddModal = useCallback(() => {
     setModalState({ isOpen: true, skill: null });
@@ -4361,7 +4935,7 @@ export default function App() {
 
   const today = useMemo(() => new Date(), []);
   const todayKey = useMemo(() => dateKey(today), [today]);
-  
+
   // Dynamic template selection based on day assignment
   const template = useMemo(() => getTemplateForDate(today, templates), [today, templates]);
   const dateStr = useMemo(() => today.toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' }), [today]);
@@ -4422,9 +4996,9 @@ export default function App() {
       }
 
       for (const oldKey of OLD_DEFAULT_KEYS) {
-        await storageHelper.delete(oldKey).catch(() => {});
+        await storageHelper.delete(oldKey).catch(() => { });
       }
-      await storageHelper.set('user-skills', JSON.stringify(loadedSkills)).catch(() => {});
+      await storageHelper.set('user-skills', JSON.stringify(loadedSkills)).catch(() => { });
 
       // Load Planner Events
       let loadedPlanner = [];
@@ -4454,11 +5028,11 @@ export default function App() {
             }
           }
           if (hasOld) {
-            await storageHelper.set('schedule_templates_v2', JSON.stringify(parsed)).catch(() => {});
+            await storageHelper.set('schedule_templates_v2', JSON.stringify(parsed)).catch(() => { });
           }
           loadedTemplates = parsed;
         } else {
-          await storageHelper.set('schedule_templates_v2', JSON.stringify(loadedTemplates)).catch(() => {});
+          await storageHelper.set('schedule_templates_v2', JSON.stringify(loadedTemplates)).catch(() => { });
         }
       } catch {
         loadedTemplates = cloneTemplates(DEFAULT_TEMPLATES);
@@ -4617,7 +5191,7 @@ export default function App() {
       } else {
         next = [...prev, skillData];
       }
-      storageHelper.set('user-skills', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('user-skills', JSON.stringify(next)).catch(() => { });
       return next;
     });
   }, []);
@@ -4639,7 +5213,7 @@ export default function App() {
           return { ...s, targetDays: filtered, targetDay: filtered.length > 0 ? filtered[0] : null };
         }
       });
-      storageHelper.set('user-skills', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('user-skills', JSON.stringify(next)).catch(() => { });
       return next;
     });
   }, []);
@@ -4649,11 +5223,11 @@ export default function App() {
 
     setSkills((prev) => {
       const next = prev.filter((s) => s.id !== skillId);
-      storageHelper.set('user-skills', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('user-skills', JSON.stringify(next)).catch(() => { });
       return next;
     });
 
-    await storageHelper.delete(`skill-steps:${skillId}`).catch(() => {});
+    await storageHelper.delete(`skill-steps:${skillId}`).catch(() => { });
     setProgress((prev) => {
       const next = { ...prev };
       delete next[skillId];
@@ -4664,7 +5238,7 @@ export default function App() {
   const addPlannerEvent = useCallback((newEvt) => {
     setPlannerEvents((prev) => {
       const next = [...prev, newEvt];
-      storageHelper.set('planner_events', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('planner_events', JSON.stringify(next)).catch(() => { });
       return next;
     });
   }, []);
@@ -4672,7 +5246,7 @@ export default function App() {
   const deletePlannerEvent = useCallback((evtId) => {
     setPlannerEvents((prev) => {
       const next = prev.filter((e) => e.id !== evtId);
-      storageHelper.set('planner_events', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('planner_events', JSON.stringify(next)).catch(() => { });
       return next;
     });
   }, []);
@@ -4680,7 +5254,7 @@ export default function App() {
   const togglePlannerEvent = useCallback((evtId) => {
     setPlannerEvents((prev) => {
       const next = prev.map((e) => (e.id === evtId ? { ...e, done: !e.done } : e));
-      storageHelper.set('planner_events', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('planner_events', JSON.stringify(next)).catch(() => { });
       return next;
     });
   }, []);
@@ -4690,7 +5264,7 @@ export default function App() {
       const skillMap = { ...(prev[skillId] || {}) };
       skillMap[stepId] = !skillMap[stepId];
       const next = { ...prev, [skillId]: skillMap };
-      storageHelper.set(`skill-steps:${skillId}`, JSON.stringify(skillMap)).catch(() => {});
+      storageHelper.set(`skill-steps:${skillId}`, JSON.stringify(skillMap)).catch(() => { });
       return next;
     });
   }, []);
@@ -4698,7 +5272,7 @@ export default function App() {
   const toggleDaily = useCallback((taskId) => {
     setDaily((prev) => {
       const next = { ...prev, [taskId]: !prev[taskId] };
-      storageHelper.set(`daily:${todayKey}`, JSON.stringify(next)).catch(() => {});
+      storageHelper.set(`daily:${todayKey}`, JSON.stringify(next)).catch(() => { });
       computeStreak(next).then(setStreak);
       return next;
     });
@@ -4709,7 +5283,7 @@ export default function App() {
     const key = `${origDate}|${taskId}`;
     setCatchup((prev) => {
       const next = { ...prev, [key]: !prev[key] };
-      storageHelper.set(`catchup:${todayKey}`, JSON.stringify(next)).catch(() => {});
+      storageHelper.set(`catchup:${todayKey}`, JSON.stringify(next)).catch(() => { });
       return next;
     });
   }, [todayKey]);
@@ -4718,7 +5292,7 @@ export default function App() {
   const updateTemplate = useCallback((templateKey, updatedTpl) => {
     setTemplates((prev) => {
       const next = { ...prev, [templateKey]: updatedTpl };
-      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => { });
       return next;
     });
     setHistoryDays(null);
@@ -4748,7 +5322,7 @@ export default function App() {
         };
       }
 
-      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => { });
       return next;
     });
     setHistoryDays(null);
@@ -4758,7 +5332,7 @@ export default function App() {
   const addCustomTemplate = useCallback((newKey, newTemplate) => {
     setTemplates((prev) => {
       const next = { ...prev, [newKey]: newTemplate };
-      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => { });
       return next;
     });
   }, []);
@@ -4767,7 +5341,7 @@ export default function App() {
     setTemplates((prev) => {
       const next = { ...prev };
       delete next[targetKey];
-      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => { });
       return next;
     });
     setHistoryDays(null);
@@ -4788,7 +5362,7 @@ export default function App() {
         isCustom: true,
       };
       const next = { ...prev, [copyKey]: copyTpl };
-      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => { });
       return next;
     });
   }, []);
@@ -4796,7 +5370,7 @@ export default function App() {
   const resetTemplate = useCallback((type) => {
     setTemplates((prev) => {
       const next = cloneTemplates(DEFAULT_TEMPLATES);
-      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => { });
       return next;
     });
     setHistoryDays(null);
@@ -4818,7 +5392,7 @@ export default function App() {
     };
     setExtraTasks((prev) => {
       const next = [...prev, newTask];
-      storageHelper.set(`extra-tasks:${todayKey}`, JSON.stringify(next)).catch(() => {});
+      storageHelper.set(`extra-tasks:${todayKey}`, JSON.stringify(next)).catch(() => { });
       return next;
     });
     setHistoryDays(null);
@@ -4840,7 +5414,7 @@ export default function App() {
 
     setExtraTasks((prev) => {
       const next = [...prev, ...newTasks];
-      storageHelper.set(`extra-tasks:${todayKey}`, JSON.stringify(next)).catch(() => {});
+      storageHelper.set(`extra-tasks:${todayKey}`, JSON.stringify(next)).catch(() => { });
       return next;
     });
     setHistoryDays(null);
@@ -4849,7 +5423,7 @@ export default function App() {
   const editExtraTask = useCallback((taskId, updatedData) => {
     setExtraTasks((prev) => {
       const next = prev.map((t) => (t.id === taskId ? { ...t, ...updatedData } : t));
-      storageHelper.set(`extra-tasks:${todayKey}`, JSON.stringify(next)).catch(() => {});
+      storageHelper.set(`extra-tasks:${todayKey}`, JSON.stringify(next)).catch(() => { });
       return next;
     });
     setHistoryDays(null);
@@ -4858,13 +5432,13 @@ export default function App() {
   const deleteExtraTask = useCallback((taskId) => {
     setExtraTasks((prev) => {
       const next = prev.filter((t) => t.id !== taskId);
-      storageHelper.set(`extra-tasks:${todayKey}`, JSON.stringify(next)).catch(() => {});
+      storageHelper.set(`extra-tasks:${todayKey}`, JSON.stringify(next)).catch(() => { });
       return next;
     });
     setDaily((prev) => {
       const next = { ...prev };
       delete next[taskId];
-      storageHelper.set(`daily:${todayKey}`, JSON.stringify(next)).catch(() => {});
+      storageHelper.set(`daily:${todayKey}`, JSON.stringify(next)).catch(() => { });
       return next;
     });
     setHistoryDays(null);
@@ -4881,7 +5455,7 @@ export default function App() {
           };
         }
       }
-      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => { });
       return next;
     });
     setHistoryDays(null);
@@ -4898,13 +5472,13 @@ export default function App() {
           };
         }
       }
-      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => {});
+      storageHelper.set('schedule_templates_v2', JSON.stringify(next)).catch(() => { });
       return next;
     });
     setDaily((prev) => {
       const next = { ...prev };
       delete next[taskId];
-      storageHelper.set(`daily:${todayKey}`, JSON.stringify(next)).catch(() => {});
+      storageHelper.set(`daily:${todayKey}`, JSON.stringify(next)).catch(() => { });
       return next;
     });
     setHistoryDays(null);
@@ -4915,13 +5489,13 @@ export default function App() {
       for (const prefix of ['skill-steps:', 'daily:', 'catchup:', 'schedule:', 'schedule_templates_v2', 'user-skills', 'custom_skills', 'planner_events', 'extra-tasks:']) {
         const listed = await storageHelper.list(prefix);
         if (listed?.keys) {
-          for (const k of listed.keys) await storageHelper.delete(k).catch(() => {});
+          for (const k of listed.keys) await storageHelper.delete(k).catch(() => { });
         }
       }
     } catch {
       // ignore
     }
-    await storageHelper.set('user-skills', JSON.stringify([])).catch(() => {});
+    await storageHelper.set('user-skills', JSON.stringify([])).catch(() => { });
     setSkills([]);
     setPlannerEvents([]);
     setProgress({});

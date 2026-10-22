@@ -2,24 +2,64 @@ import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
 import UserData from '../models/UserData.js';
+import RefreshToken from '../models/RefreshToken.js';
 import requireAuth from '../middleware/auth.js';
+import config from '../config.js';
+import {
+  registerSchema,
+  loginSchema,
+  passwordChangeSchema,
+  validateBody,
+} from '../middleware/validation.js';
+import {
+  loginLimiter,
+  registerLimiter,
+  recordFailedLogin,
+  resetFailedLogin,
+  checkEmailLockout,
+} from '../middleware/rateLimiter.js';
 
 const router = Router();
 
-function signToken(user) {
-  return jwt.sign({ sub: String(user.id) }, process.env.JWT_SECRET, { expiresIn: '30d' });
+// Sign 15-minute access token pinned with HS256 and token_version
+function signAccessToken(user) {
+  return jwt.sign(
+    {
+      sub: String(user.id),
+      token_version: user.token_version || 0,
+    },
+    config.JWT_SECRET,
+    {
+      algorithm: 'HS256',
+      expiresIn: '15m',
+    }
+  );
+}
+
+// Set secure refresh token cookie
+function setRefreshCookie(res, rawRefreshToken) {
+  res.cookie('traject_refresh_token', rawRefreshToken, {
+    httpOnly: true,
+    secure: config.NODE_ENV === 'production',
+    sameSite: config.NODE_ENV === 'production' ? 'strict' : 'lax',
+    path: '/api/auth',
+    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+  });
+}
+
+function clearRefreshCookie(res) {
+  res.clearCookie('traject_refresh_token', {
+    httpOnly: true,
+    secure: config.NODE_ENV === 'production',
+    sameSite: config.NODE_ENV === 'production' ? 'strict' : 'lax',
+    path: '/api/auth',
+  });
 }
 
 // POST /api/auth/register
-router.post('/register', async (req, res) => {
+router.post('/register', registerLimiter, validateBody(registerSchema), async (req, res) => {
   try {
-    const { name, email, password } = req.body || {};
-    if (!name || !email || !password) {
-      return res.status(400).json({ error: 'Name, email and password are required' });
-    }
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    }
+    const { name, email, password } = req.body;
 
     const existing = await User.findByEmail(email);
     if (existing) {
@@ -27,37 +67,121 @@ router.post('/register', async (req, res) => {
     }
 
     const user = await User.create({ name, email, password });
-    const token = signToken(user);
-    res.status(201).json({ token, user: User.toSafeJSON(user) });
+    const accessToken = signAccessToken(user);
+    const refreshToken = await RefreshToken.createToken(user.id, 30);
+    setRefreshCookie(res, refreshToken);
+
+    return res.status(201).json({
+      token: accessToken,
+      refreshToken,
+      user: User.toSafeJSON(user),
+    });
   } catch (err) {
-    console.error('Register error:', err);
-    res.status(500).json({ error: 'Something went wrong while creating your account' });
+    console.error('Register error:', err.message);
+    return res.status(500).json({ error: 'Something went wrong while creating your account' });
   }
 });
 
 // POST /api/auth/login
-router.post('/login', async (req, res) => {
+router.post(
+  '/login',
+  loginLimiter,
+  checkEmailLockout,
+  validateBody(loginSchema),
+  async (req, res) => {
+    try {
+      const { email, password } = req.body;
+
+      const user = await User.findByEmail(email);
+      if (!user) {
+        // Run constant-time dummy compare to prevent timing-based user enumeration
+        await User.dummyCompare(password);
+        recordFailedLogin(email);
+        return res.status(401).json({ error: 'Invalid email or password' });
+      }
+
+      const valid = await User.checkPassword(user, password);
+      if (!valid) {
+        recordFailedLogin(email);
+        return res.status(401).json({ error: 'Invalid email or password' });
+      }
+
+      // Successful login resets failed attempts
+      resetFailedLogin(email);
+
+      const accessToken = signAccessToken(user);
+      const refreshToken = await RefreshToken.createToken(user.id, 30);
+      setRefreshCookie(res, refreshToken);
+
+      return res.json({
+        token: accessToken,
+        refreshToken,
+        user: User.toSafeJSON(user),
+      });
+    } catch (err) {
+      console.error('Login error:', err.message);
+      return res.status(500).json({ error: 'Something went wrong while logging in' });
+    }
+  }
+);
+
+// POST /api/auth/refresh
+router.post('/refresh', async (req, res) => {
   try {
-    const { email, password } = req.body || {};
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
+    const rawRefreshToken =
+      req.cookies?.traject_refresh_token || req.body?.refreshToken;
+
+    if (!rawRefreshToken) {
+      return res.status(401).json({ error: 'Refresh token is required' });
     }
 
-    const user = await User.findByEmail(email);
+    const tokenRecord = await RefreshToken.findValidToken(rawRefreshToken);
+    if (!tokenRecord) {
+      clearRefreshCookie(res);
+      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
+
+    const user = await User.findById(tokenRecord.user_id);
     if (!user) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+      clearRefreshCookie(res);
+      return res.status(401).json({ error: 'User no longer exists' });
     }
 
-    const valid = await User.checkPassword(user, password);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid email or password' });
-    }
+    // Rotate refresh token: revoke current, issue new
+    await RefreshToken.revokeToken(rawRefreshToken);
+    const newRefreshToken = await RefreshToken.createToken(user.id, 30);
+    setRefreshCookie(res, newRefreshToken);
 
-    const token = signToken(user);
-    res.json({ token, user: User.toSafeJSON(user) });
+    const newAccessToken = signAccessToken(user);
+
+    return res.json({
+      token: newAccessToken,
+      refreshToken: newRefreshToken,
+      user: User.toSafeJSON(user),
+    });
   } catch (err) {
-    console.error('Login error:', err);
-    res.status(500).json({ error: 'Something went wrong while logging in' });
+    console.error('Refresh error:', err.message);
+    return res.status(500).json({ error: 'Failed to refresh token' });
+  }
+});
+
+// POST /api/auth/logout
+router.post('/logout', requireAuth, async (req, res) => {
+  try {
+    const rawRefreshToken =
+      req.cookies?.traject_refresh_token || req.body?.refreshToken;
+
+    if (rawRefreshToken) {
+      await RefreshToken.revokeToken(rawRefreshToken);
+    }
+    await RefreshToken.revokeAllForUser(req.userId);
+    await User.incrementTokenVersion(req.userId);
+    clearRefreshCookie(res);
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Logout error:', err.message);
+    return res.status(500).json({ error: 'Failed to logout' });
   }
 });
 
@@ -65,48 +189,56 @@ router.post('/login', async (req, res) => {
 router.get('/me', requireAuth, async (req, res) => {
   try {
     const user = await User.findById(req.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ user: User.toSafeJSON(user) });
+    if (!user) return res.status(401).json({ error: 'User not found' });
+    return res.json({ user: User.toSafeJSON(user) });
   } catch (err) {
-    console.error('Me error:', err);
-    res.status(500).json({ error: 'Something went wrong' });
+    console.error('Me error:', err.message);
+    return res.status(500).json({ error: 'Something went wrong' });
   }
 });
 
 // PUT /api/auth/password
-router.put('/password', requireAuth, async (req, res) => {
+router.put('/password', requireAuth, validateBody(passwordChangeSchema), async (req, res) => {
   try {
-    const { currentPassword, newPassword } = req.body || {};
-    if (!currentPassword || !newPassword) {
-      return res.status(400).json({ error: 'Current password and new password are required' });
-    }
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: 'New password must be at least 6 characters' });
-    }
+    const { currentPassword, newPassword } = req.body;
 
     const user = await User.findById(req.userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user) return res.status(401).json({ error: 'User not found' });
 
     const valid = await User.checkPassword(user, currentPassword);
     if (!valid) return res.status(401).json({ error: 'Incorrect current password' });
 
     await User.setPassword(req.userId, newPassword);
-    res.json({ message: 'Password updated successfully' });
+    await RefreshToken.revokeAllForUser(req.userId);
+
+    // Issue fresh tokens after password change
+    const updatedUser = await User.findById(req.userId);
+    const accessToken = signAccessToken(updatedUser);
+    const refreshToken = await RefreshToken.createToken(req.userId, 30);
+    setRefreshCookie(res, refreshToken);
+
+    return res.json({
+      message: 'Password updated successfully',
+      token: accessToken,
+      refreshToken,
+    });
   } catch (err) {
-    console.error('Password update error:', err);
-    res.status(500).json({ error: 'Something went wrong while updating password' });
+    console.error('Password update error:', err.message);
+    return res.status(500).json({ error: 'Something went wrong while updating password' });
   }
 });
 
 // DELETE /api/auth/account
 router.delete('/account', requireAuth, async (req, res) => {
   try {
+    await RefreshToken.revokeAllForUser(req.userId);
     await UserData.deleteAllForUser(req.userId);
     await User.deleteById(req.userId);
-    res.json({ deleted: true });
+    clearRefreshCookie(res);
+    return res.json({ deleted: true });
   } catch (err) {
-    console.error('Delete account error:', err);
-    res.status(500).json({ error: 'Something went wrong while deleting account' });
+    console.error('Delete account error:', err.message);
+    return res.status(500).json({ error: 'Something went wrong while deleting account' });
   }
 });
 

@@ -1,58 +1,35 @@
 import { useState, useEffect } from 'react';
 import App from '../ASCEND_Learning_Roadmap_Tracker.jsx';
+import {
+  authApi,
+  dataApi,
+  setAccessToken,
+  setOnUnauthorized,
+  setOnRateLimited,
+} from './api.js';
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
-const TOKEN_KEY = 'traject_token';
-
-function authHeaders() {
-  const token = localStorage.getItem(TOKEN_KEY);
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-async function parseOrThrow(res) {
-  let body = null;
-  try {
-    body = await res.json();
-  } catch {
-    // no body
-  }
-  if (!res.ok) throw new Error(body?.error || `Request failed (${res.status})`);
-  return body;
-}
-
-/**
- * Replaces window.storage with a version backed by our Express + MongoDB API.
- * The existing App.jsx already calls window.storage.get/set/delete/list, so
- * once this is installed, every read/write is automatically scoped to the
- * logged-in user — no changes needed inside App.jsx itself.
- */
 function installApiStorage() {
   window.storage = {
-    async get(key) {
-      const res = await fetch(`${API_BASE}/data/${encodeURIComponent(key)}`, { headers: authHeaders() });
-      if (res.status === 404) return null;
-      return parseOrThrow(res);
-    },
-    async set(key, value) {
-      const res = await fetch(`${API_BASE}/data/${encodeURIComponent(key)}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ value }),
-      });
-      return parseOrThrow(res);
-    },
-    async delete(key) {
-      const res = await fetch(`${API_BASE}/data/${encodeURIComponent(key)}`, {
-        method: 'DELETE',
-        headers: authHeaders(),
-      });
-      return parseOrThrow(res);
-    },
-    async list(prefix) {
-      const res = await fetch(`${API_BASE}/data?prefix=${encodeURIComponent(prefix || '')}`, { headers: authHeaders() });
-      return parseOrThrow(res);
-    },
+    get: (key) => dataApi.get(key),
+    set: (key, value) => dataApi.set(key, value),
+    delete: (key) => dataApi.delete(key),
+    list: (prefix) => dataApi.list(prefix),
   };
+}
+
+function clearAppLocalStorage() {
+  try {
+    const keysToRemove = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && (k.startsWith('ascend_') || k.startsWith('daily:') || k.startsWith('catchup:') || k.startsWith('extra-tasks:') || k === 'user-skills' || k === 'planner_events' || k === 'schedule_templates_v2' || k.startsWith('skill-steps:') || k === 'dashboard-prefs' || k === 'traject_token')) {
+        keysToRemove.push(k);
+      }
+    }
+    keysToRemove.forEach((k) => localStorage.removeItem(k));
+  } catch (e) {
+    console.warn('Failed to clear localStorage keys on logout:', e);
+  }
 }
 
 const inputStyle = {
@@ -74,23 +51,35 @@ export default function AuthGate() {
   const [form, setForm] = useState({ name: '', email: '', password: '' });
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [toastMessage, setToastMessage] = useState(null);
 
-  // On first load, if we already have a token, verify it and skip straight to the app
   useEffect(() => {
-    const token = localStorage.getItem(TOKEN_KEY);
-    if (!token) {
-      setStatus('guest');
-      return;
-    }
-    installApiStorage();
-    fetch(`${API_BASE}/auth/me`, { headers: authHeaders() })
-      .then(parseOrThrow)
-      .then((data) => {
-        setUser(data.user);
-        setStatus('authed');
+    // Listen for unauthorized events to automatically log out
+    setOnUnauthorized(() => {
+      handleLogout();
+    });
+
+    // Listen for rate-limited events
+    setOnRateLimited((msg) => {
+      setToastMessage(msg);
+      setTimeout(() => setToastMessage(null), 4000);
+    });
+
+    // Check if user has an active session (via refresh token cookie)
+    authApi
+      .refresh()
+      .then((refreshed) => {
+        if (refreshed) {
+          return authApi.me().then((meData) => {
+            installApiStorage();
+            setUser(meData.user);
+            setStatus('authed');
+          });
+        } else {
+          setStatus('guest');
+        }
       })
       .catch(() => {
-        localStorage.removeItem(TOKEN_KEY);
         setStatus('guest');
       });
   }, []);
@@ -100,18 +89,13 @@ export default function AuthGate() {
     setError('');
     setBusy(true);
     try {
-      const endpoint = mode === 'login' ? 'login' : 'register';
-      const payload =
-        mode === 'login'
-          ? { email: form.email, password: form.password }
-          : { name: form.name, email: form.email, password: form.password };
-      const res = await fetch(`${API_BASE}/auth/${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const data = await parseOrThrow(res);
-      localStorage.setItem(TOKEN_KEY, data.token);
+      let data;
+      if (mode === 'login') {
+        data = await authApi.login(form.email, form.password);
+      } else {
+        data = await authApi.register(form.name, form.email, form.password);
+      }
+
       installApiStorage();
       setUser(data.user);
       setStatus('authed');
@@ -122,9 +106,10 @@ export default function AuthGate() {
     }
   }
 
-  function handleLogout() {
-    localStorage.removeItem(TOKEN_KEY);
+  async function handleLogout() {
+    await authApi.logout();
     delete window.storage;
+    clearAppLocalStorage();
     setUser(null);
     setForm({ name: '', email: '', password: '' });
     setStatus('guest');
@@ -151,10 +136,19 @@ export default function AuthGate() {
           </div>
 
           {mode === 'register' && (
-            <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Name" required style={inputStyle} />
+            <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Name (max 60 chars)" required maxLength={60} style={inputStyle} />
           )}
-          <input value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="Email" type="email" required style={inputStyle} />
-          <input value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="Password" type="password" required style={inputStyle} />
+          <input value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="Email" type="email" required maxLength={254} style={inputStyle} />
+          <input
+            value={form.password}
+            onChange={(e) => setForm({ ...form, password: e.target.value })}
+            placeholder={mode === 'register' ? 'Password (6-10 characters)' : 'Password'}
+            type="password"
+            required
+            minLength={mode === 'register' ? 6 : 1}
+            maxLength={mode === 'register' ? 10 : 128}
+            style={inputStyle}
+          />
 
           {error && <div style={{ color: '#B0453A', fontSize: 13, marginBottom: 12 }}>{error}</div>}
 
@@ -182,6 +176,11 @@ export default function AuthGate() {
 
   return (
     <div>
+      {toastMessage && (
+        <div style={{ position: 'fixed', top: 16, right: 16, zIndex: 9999, background: '#F59E0B', color: '#000', padding: '10px 16px', borderRadius: 8, fontWeight: 600, boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
+          ⚠️ {toastMessage}
+        </div>
+      )}
       <div style={{ background: '#0D2725', color: '#D9D5C7', fontSize: 12, padding: '6px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontFamily: 'Inter, sans-serif' }}>
         <span>
           Logged in as <strong style={{ color: '#E3C077' }}>{user?.name}</strong>

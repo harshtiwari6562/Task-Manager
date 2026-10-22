@@ -1,8 +1,6 @@
-# Roadmap: Isi App ko Multi-User Banane ke liye (Google Antigravity se khud banane ke liye)
+# Roadmap: Multi-User Architecture (Express + MySQL + JWT + React/Vite)
 
-Ye guide un exact steps ko todke deti hai jo maine abhi follow kiye — taaki aap Antigravity (ya koi bhi agentic coding tool) me inhe khud bhi try kar sako. Har step me **kya banega** aur **kyon** likha hai, plus ek **example prompt** jo aap Antigravity ko de sakte ho.
-
-Isse aapke Full-Stack roadmap ka "Node.js + Express + MongoDB" module bhi directly practice ho jayega — ye asli production-style pattern hai.
+Ye guide un exact steps ko explain karti hai jisse application ko production-ready, secure multi-user banaya gaya hai. Backend **Node.js + Express + MySQL** use karta hai aur frontend **React 18 + Vite** ke saath integrated hai.
 
 ---
 
