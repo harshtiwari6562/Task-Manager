@@ -10,6 +10,10 @@ import pool, { initDB } from './db.js';
 import authRoutes from './routes/auth.js';
 import dataRoutes from './routes/data.js';
 import aiRoutes from './routes/ai.js';
+import plannerRoutes from './routes/planner.js';
+import extraTasksRoutes from './routes/extraTasks.js';
+import dailyRoutes from './routes/daily.js';
+import skillsRoutes from './routes/skills.js';
 import requireAuth from './middleware/auth.js';
 import { generalLimiter } from './middleware/rateLimiter.js';
 
@@ -151,6 +155,10 @@ app.get(['/api/health/db', '/api/v1/health/db'], async (req, res) => {
 app.use(['/api/auth', '/api/v1/auth'], authRoutes);
 app.use(['/api/data', '/api/v1/data'], requireAuth, dataRoutes);
 app.use(['/api/ai', '/api/v1/ai'], requireAuth, aiRoutes);
+app.use(['/api/planner', '/api/v1/planner'], requireAuth, plannerRoutes);
+app.use(['/api/extra-tasks', '/api/v1/extra-tasks'], requireAuth, extraTasksRoutes);
+app.use(['/api/daily', '/api/v1/daily'], requireAuth, dailyRoutes);
+app.use(['/api/skills', '/api/v1/skills'], requireAuth, skillsRoutes);
 
 // 10. Central 404 Handler (JSON only)
 app.use((req, res) => {

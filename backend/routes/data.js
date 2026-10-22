@@ -7,6 +7,8 @@ import UserData, {
   ConflictError,
   isAllowedKey,
 } from '../models/UserData.js';
+import { refreshReminderIndex } from '../services/reminderIndex.js';
+import { notifySync } from '../services/pushService.js';
 
 const router = Router();
 
@@ -123,6 +125,11 @@ router.post('/batch', async (req, res) => {
     }
 
     const batchResult = await UserData.batch(req.userId, parsed.data.ops);
+    const keysMutated = parsed.data.ops.map((o) => o.key);
+    if (keysMutated.includes('planner_events')) {
+      refreshReminderIndex(req.userId).catch(() => {});
+    }
+    notifySync(req.userId, keysMutated);
     return res.json(batchResult);
   } catch (err) {
     if (err instanceof ConflictError || err.status === 409 || err.code === 'conflict') {
@@ -192,6 +199,10 @@ router.put('/:key', validateKeyParam, async (req, res) => {
     }
 
     const doc = await UserData.set(req.userId, req.params.key, value, baseUpdatedAt);
+    if (req.params.key === 'planner_events') {
+      refreshReminderIndex(req.userId).catch(() => {});
+    }
+    notifySync(req.userId, [req.params.key]);
     return res.json(doc);
   } catch (err) {
     if (err instanceof ConflictError || err.status === 409 || err.code === 'conflict') {
@@ -224,6 +235,10 @@ router.delete('/:key', validateKeyParam, async (req, res) => {
   try {
     const baseUpdatedAt = req.body?.baseUpdatedAt || req.query?.baseUpdatedAt || null;
     await UserData.delete(req.userId, req.params.key, baseUpdatedAt);
+    if (req.params.key === 'planner_events') {
+      refreshReminderIndex(req.userId).catch(() => {});
+    }
+    notifySync(req.userId, [req.params.key]);
     return res.json({ key: req.params.key, deleted: true });
   } catch (err) {
     if (err instanceof ConflictError || err.status === 409 || err.code === 'conflict') {
