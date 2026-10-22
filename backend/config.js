@@ -30,7 +30,7 @@ function validateEnv() {
   let dbUser = process.env.DB_USER || '';
   let dbPassword = process.env.DB_PASSWORD !== undefined ? process.env.DB_PASSWORD : '';
   let dbName = process.env.DB_NAME || '';
-  let dbSsl = process.env.DB_SSL === 'true';
+  let dbSsl = process.env.DB_SSL === 'true' || dbHost.includes('tidbcloud.com') || dbHost.includes('aivencloud.com');
 
   if (process.env.DATABASE_URL) {
     try {
@@ -42,10 +42,14 @@ function validateEnv() {
       dbUser = decodeURIComponent(parsedUrl.username || '');
       dbPassword = decodeURIComponent(parsedUrl.password || '');
       dbName = parsedUrl.pathname.replace(/^\//, '');
+      const sslParam = parsedUrl.searchParams.get('ssl') || '';
       if (
-        parsedUrl.searchParams.get('ssl') === 'true' ||
+        sslParam === 'true' ||
+        sslParam.includes('rejectUnauthorized') ||
         parsedUrl.searchParams.get('sslmode') === 'require' ||
-        parsedUrl.searchParams.get('ssl-mode') === 'REQUIRED'
+        parsedUrl.searchParams.get('ssl-mode') === 'REQUIRED' ||
+        parsedUrl.hostname.includes('tidbcloud.com') ||
+        parsedUrl.hostname.includes('aivencloud.com')
       ) {
         dbSsl = true;
       }

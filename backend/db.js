@@ -7,6 +7,11 @@ import config from './config.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 let poolInstance = null;
+let dbReady = false;
+
+export function isDbReady() {
+  return dbReady;
+}
 
 /**
  * Runs SQL migrations from the backend/migrations folder in sequential order.
@@ -96,6 +101,13 @@ export async function initDB() {
     }
 
     // 2. Create pool connected directly to the database (small pool: 5-10 connections)
+    if (poolInstance) {
+      try {
+        await poolInstance.end();
+      } catch {}
+      poolInstance = null;
+    }
+
     poolInstance = mysql.createPool({
       host: config.DB_HOST,
       port: config.DB_PORT,
@@ -122,8 +134,10 @@ export async function initDB() {
       conn.release();
     }
 
+    dbReady = true;
     console.log(`[DB] Successfully connected to MySQL database: ${config.DB_NAME} (utf8mb4, SSL: ${Boolean(config.DB_SSL)})`);
   } catch (err) {
+    dbReady = false;
     console.error('\n========================================');
     console.error(`[DB] MySQL connection/initialization FAILED: ${err.message}`);
     console.error(`Host: ${config.DB_HOST}:${config.DB_PORT}, User: ${config.DB_USER}, DB: ${config.DB_NAME}`);
@@ -145,8 +159,10 @@ function isRetryable(err) {
 
 const pool = {
   async execute(sql, params) {
-    if (!poolInstance) {
-      throw new Error('Database pool not initialized. Wait for initDB() to complete.');
+    if (!poolInstance || !dbReady) {
+      const err = new Error('Database is connecting or temporarily unavailable. Please verify database connection settings.');
+      err.status = 503;
+      throw err;
     }
     try {
       return await poolInstance.execute(sql, params);
@@ -159,8 +175,10 @@ const pool = {
     }
   },
   async query(sql, params) {
-    if (!poolInstance) {
-      throw new Error('Database pool not initialized. Wait for initDB() to complete.');
+    if (!poolInstance || !dbReady) {
+      const err = new Error('Database is connecting or temporarily unavailable. Please verify database connection settings.');
+      err.status = 503;
+      throw err;
     }
     try {
       return await poolInstance.query(sql, params);
@@ -173,8 +191,10 @@ const pool = {
     }
   },
   getConnection() {
-    if (!poolInstance) {
-      throw new Error('Database pool not initialized. Wait for initDB() to complete.');
+    if (!poolInstance || !dbReady) {
+      const err = new Error('Database is connecting or temporarily unavailable. Please verify database connection settings.');
+      err.status = 503;
+      throw err;
     }
     return poolInstance.getConnection();
   },

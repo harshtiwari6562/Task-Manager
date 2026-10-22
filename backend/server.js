@@ -6,7 +6,7 @@ import cookieParser from 'cookie-parser';
 import pino from 'pino';
 import pinoHttp from 'pino-http';
 import config from './config.js';
-import pool, { initDB } from './db.js';
+import pool, { initDB, isDbReady } from './db.js';
 import authRoutes from './routes/auth.js';
 import dataRoutes from './routes/data.js';
 import aiRoutes from './routes/ai.js';
@@ -219,23 +219,36 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
-// Start DB then HTTP server (skip auto-listen during automated testing)
+// Start HTTP server immediately so Render port detection & health checks pass
 if (config.NODE_ENV !== 'test') {
-  initDB()
-    .then(() => {
-      server = app.listen(config.PORT, () => {
-        console.log(`Traject backend running on http://localhost:${config.PORT} (${config.NODE_ENV})`);
-      });
+  server = app.listen(config.PORT, () => {
+    console.log(`Traject backend running on port ${config.PORT} (${config.NODE_ENV})`);
+  });
 
-      // Request & Connection timeouts
-      server.requestTimeout = 30000;
-      server.headersTimeout = 35000;
-      server.keepAliveTimeout = 65000;
-    })
-    .catch((err) => {
-      console.error('[Fatal] Database startup failed:', err.message);
-      process.exit(1);
-    });
+  // Request & Connection timeouts
+  server.requestTimeout = 30000;
+  server.headersTimeout = 35000;
+  server.keepAliveTimeout = 65000;
+
+  // Resilient background database initialization loop
+  (async function connectWithRetry() {
+    let attempts = 0;
+    while (!isDbReady()) {
+      attempts++;
+      try {
+        await initDB();
+        console.log(`[DB] Database connected and initialized on attempt ${attempts}.`);
+        break;
+      } catch (err) {
+        console.error(`[DB] Database initialization attempt ${attempts} failed: ${err.message}`);
+        if (config.DB_HOST === 'localhost' || config.DB_HOST === '127.0.0.1') {
+          console.warn('[DB] WARNING: DB_HOST is set to localhost. When deploying on Render, you MUST use an external cloud database (e.g. TiDB Cloud or Aiven) because Render web services do not host a local MySQL server.');
+        }
+        console.warn('[DB] Retrying database connection in 10 seconds...');
+        await new Promise((resolve) => setTimeout(resolve, 10000));
+      }
+    }
+  })();
 }
 
 export default app;
